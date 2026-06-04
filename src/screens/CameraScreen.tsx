@@ -11,7 +11,7 @@ import {
   Camera,
   useCameraDevice,
   useCameraPermission,
-  useFrameProcessor,
+  useCameraFormat,
 } from 'react-native-vision-camera';
 import * as Speech from 'expo-speech';
 import * as Haptics from 'expo-haptics';
@@ -28,6 +28,11 @@ interface Result {
 
 export default function CameraScreen() {
   const device = useCameraDevice('back');
+  // Pick the highest FPS format available on this device (120fps if supported, else max)
+  const format = useCameraFormat(device, [
+    { fps: 120 },
+    { fps: 60 },
+  ]);
   const { hasPermission, requestPermission } = useCameraPermission();
   const [phase, setPhase] = useState<Phase>('idle');
   const [result, setResult] = useState<Result | null>(null);
@@ -85,24 +90,9 @@ export default function CameraScreen() {
     }, 4000);
   }, []);
 
-  // Frame processor: runs on every camera frame at 120fps
-  const frameProcessor = useFrameProcessor(
-    (frame) => {
-      'worklet';
-      // This block runs on the camera thread — no React state access.
-      // We use a simple motion detection heuristic:
-      // compare brightness of center strip vs edges to detect a disc passing over.
-      if (!detectingRef.current) return;
-
-      const width = frame.width;
-      const height = frame.height;
-
-      // Sample a horizontal strip through the center of the frame
-      // In a real implementation, access frame.toArrayBuffer() for pixel data.
-      // Here we trigger detection logic via a JS callback on the main thread.
-    },
-    [detectingRef]
-  );
+  // Frame processor placeholder — will be wired to disc detection logic
+  // once react-native-worklets-core is fully configured in the native build.
+  const frameProcessor = undefined;
 
   // Simulated detection trigger for development/testing
   // In production, the frame processor calls this when a disc is detected.
@@ -164,8 +154,8 @@ export default function CameraScreen() {
         style={StyleSheet.absoluteFill}
         device={device}
         isActive={phase === 'ready' || phase === 'detecting'}
-        fps={120}
-        frameProcessor={frameProcessor}
+        format={format}
+        fps={format?.maxFps ?? 30}
         photo={false}
         video={false}
         audio={false}
