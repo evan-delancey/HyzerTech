@@ -14,6 +14,15 @@ import {
   useFrameProcessor,
 } from 'react-native-vision-camera';
 import { runOnJS } from 'react-native-reanimated';
+
+// Check if worklets-core is available in this native binary
+let workletsAvailable = false;
+try {
+  require('react-native-worklets-core');
+  workletsAvailable = true;
+} catch {
+  workletsAvailable = false;
+}
 import * as Speech from 'expo-speech';
 import * as Haptics from 'expo-haptics';
 import { colors } from '../lib/theme';
@@ -150,7 +159,7 @@ export default function CameraScreen() {
     [phase]
   );
 
-  // ─── Frame processor ───────────────────────────────────────────────────────
+  // ─── Frame processor (only active when worklets-core is in native binary) ──
   // Runs on every camera frame at full frame rate.
   // Algorithm:
   //   1. Calibrate: average brightness of first 30 frames = baseline (open sky/ceiling)
@@ -161,6 +170,8 @@ export default function CameraScreen() {
   const frameProcessor = useFrameProcessor(
     (frame) => {
       'worklet';
+      // Guard: if worklets-core isn't in the native binary, skip all processing
+      if (!workletsAvailable) return;
       if (!isReadyRef.current) return;
 
       const width = frame.width;
@@ -330,7 +341,7 @@ export default function CameraScreen() {
         isActive={phase === 'ready' || phase === 'detecting'}
         format={format}
         fps={format?.maxFps ?? 30}
-        frameProcessor={frameProcessor}
+        frameProcessor={workletsAvailable ? frameProcessor : undefined}
         photo={false}
         video={false}
         audio={false}
