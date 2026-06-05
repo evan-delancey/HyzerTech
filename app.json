@@ -37,11 +37,10 @@
     "plugins": [
       "expo-dev-client",
       [
-        "expo-camera",
+        "react-native-vision-camera",
         {
-          "cameraPermission": "HyzerTech uses your camera to measure disc speed.",
-          "recordAudioAndroid": false,
-          "barcodeScannerEnabled": false
+          "cameraPermissionText": "HyzerTech uses your camera to measure disc speed and spin.",
+          "enableFrameProcessors": true
         }
       ]
     ],
