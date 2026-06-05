@@ -25,7 +25,7 @@ try {
 type Phase = 'idle' | 'ready' | 'result';
 
 interface Result { speedMph: number; spinRpm: number; }
-interface DebugInfo { brightness: number; baseline: number; fps: number; workletsOk: boolean; }
+interface DebugInfo { brightness: number; baseline: number; fps: number; workletsOk: boolean; bufLen: number; frameW: number; frameH: number; }
 
 // ── Physics ──────────────────────────────────────────────────────────────────
 const DISC_DIAMETER_CM = 21.2;
@@ -56,7 +56,7 @@ export default function CameraScreen() {
 
   const [phase, setPhase] = useState<Phase>('idle');
   const [result, setResult] = useState<Result | null>(null);
-  const [debug, setDebug] = useState<DebugInfo>({ brightness: 0, baseline: 0, fps: 0, workletsOk: workletsAvailable });
+  const [debug, setDebug] = useState<DebugInfo>({ brightness: 0, baseline: 0, fps: 0, workletsOk: workletsAvailable, bufLen: 0, frameW: 0, frameH: 0 });
   const pulseAnim = useRef(new Animated.Value(1)).current;
   const resultTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
@@ -83,8 +83,8 @@ export default function CameraScreen() {
   }, [phase, pulseAnim]);
 
   // Update debug display (called from worklet via runOnJS)
-  const updateDebug = useCallback((brightness: number, baseline: number, fps: number) => {
-    setDebug({ brightness: Math.round(brightness), baseline: Math.round(baseline), fps, workletsOk: true });
+  const updateDebug = useCallback((brightness: number, baseline: number, fps: number, bufLen: number, frameW: number, frameH: number) => {
+    setDebug({ brightness: Math.round(brightness), baseline: Math.round(baseline), fps, workletsOk: true, bufLen, frameW, frameH });
   }, []);
 
   // Called from worklet when disc event is complete
@@ -134,33 +134,45 @@ export default function CameraScreen() {
     let count = 0;
     let leftX = w;
     let rightX = 0;
+    let bufLen = 0;
 
     try {
       const buf = frame.toArrayBuffer();
       const pixels = new Uint8Array(buf);
-      const bufLen = pixels.length;
+      bufLen = pixels.length;
+
+      if (bufLen === 0) {
+        // Buffer is empty — can't process this frame
+        runOnJS(updateDebug)(0, baselineRef.current, format?.maxFps ?? 0, 0, w, h);
+        return;
+      }
 
       // Detect pixel format from buffer size:
-      // YUV_420_888 → bufLen ≈ w*h*1.5  (Y plane is w*h bytes)
+      // YUV_420_888 → bufLen ≈ w*h*1.5  (Y plane is first w*h bytes)
       // BGRA/RGBA   → bufLen ≈ w*h*4
-      const isYUV = bufLen < w * h * 2;
-      const stride = isYUV ? 1 : 4;
+      // Some devices use row-padded YUV where rowStride > width
+      const expectedYUV = w * h * 1.5;
+      const expectedRGBA = w * h * 4;
+      const isYUV = bufLen <= expectedYUV * 1.1; // within 10% of YUV size
 
       // Sample the center 20% horizontal strip
       const top = Math.floor(h * 0.4);
       const bot = Math.floor(h * 0.6);
       const step = 6;
+      // Some devices pad rows — estimate row stride
+      const yStride = isYUV ? Math.floor(bufLen / (h * 1.5)) : w * 4;
 
       for (let y = top; y < bot; y += 2) {
         for (let x = 0; x < w; x += step) {
           let lum: number;
           if (isYUV) {
-            const idx = y * w + x;
+            const idx = y * yStride + x;
             if (idx >= bufLen) continue;
             lum = pixels[idx];
           } else {
-            const idx = (y * w + x) * stride;
+            const idx = (y * w + x) * 4;
             if (idx + 2 >= bufLen) continue;
+            // BGRA on Android, RGBA on iOS
             lum = pixels[idx] * 0.114 + pixels[idx + 1] * 0.587 + pixels[idx + 2] * 0.299;
           }
           brightness += lum;
@@ -172,7 +184,8 @@ export default function CameraScreen() {
         }
       }
     } catch {
-      return; // frame.toArrayBuffer() failed — older device or wrong native binary
+      runOnJS(updateDebug)(-1, -1, 0, -1, w, h);
+      return; // frame.toArrayBuffer() failed
     }
 
     if (count === 0) return;
@@ -186,13 +199,13 @@ export default function CameraScreen() {
         baselineRef.current = (baselineRef.current * calibCountRef.current + avg) / (calibCountRef.current + 1);
       }
       calibCountRef.current++;
-      runOnJS(updateDebug)(avg, baselineRef.current, fps);
+      runOnJS(updateDebug)(avg, baselineRef.current, fps, bufLen, w, h);
       return;
     }
 
     // Update debug display every 10 frames to avoid flooding
     if (darkCountRef.current === 0) {
-      runOnJS(updateDebug)(avg, baselineRef.current, fps);
+      runOnJS(updateDebug)(avg, baselineRef.current, fps, bufLen, w, h);
     }
 
     const isDark = avg < baselineRef.current - DROP_THRESHOLD;
@@ -317,14 +330,16 @@ export default function CameraScreen() {
                     {debug.workletsOk ? '✓ active' : '✗ not available'}
                   </Text>
                 </Text>
+                <Text style={styles.debugRow}>Frame: <Text style={styles.debugVal}>{debug.frameW}×{debug.frameH}</Text></Text>
+                <Text style={styles.debugRow}>Buffer: <Text style={styles.debugVal}>{debug.bufLen === 0 ? 'EMPTY ⚠️' : debug.bufLen === -1 ? 'ERROR ⚠️' : debug.bufLen}</Text></Text>
                 <Text style={styles.debugRow}>Brightness: <Text style={styles.debugVal}>{debug.brightness}</Text></Text>
                 <Text style={styles.debugRow}>Baseline:   <Text style={styles.debugVal}>{debug.baseline}</Text></Text>
-                <Text style={styles.debugRow}>Drop needed: <Text style={styles.debugVal}>{DROP_THRESHOLD}+</Text></Text>
                 <Text style={styles.debugRow}>FPS: <Text style={styles.debugVal}>{debug.fps}</Text></Text>
                 <Text style={[styles.debugRow, { color: colors.gray, marginTop: 4, fontSize: 11 }]}>
-                  {debug.baseline > 0 && debug.brightness > 0
-                    ? `Current drop: ${debug.baseline - debug.brightness} (need ${DROP_THRESHOLD}+)`
-                    : calibCountRef.current < 40 ? 'Calibrating...' : 'Waiting for disc'}
+                  {debug.bufLen <= 0 ? 'Buffer empty — toArrayBuffer() issue' :
+                   debug.baseline > 0 && debug.brightness > 0
+                    ? `Drop: ${debug.baseline - debug.brightness} (need ${DROP_THRESHOLD}+)`
+                    : 'Calibrating...'}
                 </Text>
               </View>
 
