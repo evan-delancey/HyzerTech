@@ -1,11 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import {
-  StyleSheet,
-  View,
-  Text,
-  TouchableOpacity,
-  Animated,
-} from 'react-native';
+import { StyleSheet, View, Text, TouchableOpacity, Animated } from 'react-native';
 import {
   Camera,
   useCameraDevice,
@@ -14,8 +8,12 @@ import {
   useFrameProcessor,
 } from 'react-native-vision-camera';
 import { runOnJS } from 'react-native-reanimated';
+import * as Speech from 'expo-speech';
+import * as Haptics from 'expo-haptics';
+import { colors } from '../lib/theme';
+import { saveThrow } from '../lib/db';
 
-// Check if worklets-core is available in this native binary
+// Check if worklets-core is compiled into this native binary
 let workletsAvailable = false;
 try {
   require('react-native-worklets-core');
@@ -23,67 +21,32 @@ try {
 } catch {
   workletsAvailable = false;
 }
-import * as Speech from 'expo-speech';
-import * as Haptics from 'expo-haptics';
-import { colors } from '../lib/theme';
-import { saveThrow } from '../lib/db';
 
-type Phase = 'idle' | 'ready' | 'detecting' | 'result';
+type Phase = 'idle' | 'ready' | 'result';
 
-interface Result {
-  speedMph: number;
-  spinRpm: number;
-}
+interface Result { speedMph: number; spinRpm: number; }
+interface DebugInfo { brightness: number; baseline: number; fps: number; workletsOk: boolean; }
 
-// ─── Detection constants ───────────────────────────────────────────────────
-// How much brightness must drop (0-255) to count as a disc detection event
-const BRIGHTNESS_DROP_THRESHOLD = 40;
-// Minimum number of consecutive dark frames to confirm a disc (not noise)
-const MIN_DARK_FRAMES = 2;
-// Maximum frames a disc event can span (avoids false positives from shadows)
-const MAX_DISC_FRAMES = 60;
-// Known disc diameter in cm (standard 175g disc golf disc)
+// ── Physics ──────────────────────────────────────────────────────────────────
 const DISC_DIAMETER_CM = 21.2;
-// Camera height off ground in cm (5 feet)
-const CAMERA_HEIGHT_CM = 152;
-// Approximate horizontal FOV in degrees for most phone cameras
+const CAMERA_HEIGHT_CM = 152; // 5 feet
 const H_FOV_DEG = 69;
+const DROP_THRESHOLD = 25;   // brightness units drop needed to detect disc
+const MIN_DARK_FRAMES = 1;   // even 1 frame counts — disc is fast!
+const MAX_DARK_FRAMES = 45;  // more than this = shadow, not disc
 
-function estimateSpeedMph(
-  darkFrameCount: number,
-  fps: number,
-  imageWidthPx: number,
-  discRadiusPx: number
-): number {
-  // Time the disc spent over the camera (in seconds)
-  const durationSec = darkFrameCount / fps;
-
-  // Real-world width of the scene at the disc's estimated altitude
-  const altitudeCm = CAMERA_HEIGHT_CM; // simplification — disc is at ~ground level relative to camera
+function speedMph(darkFrames: number, fps: number): number {
+  const durationSec = Math.max(darkFrames, 1) / fps;
   const hFovRad = (H_FOV_DEG * Math.PI) / 180;
-  const sceneWidthCm = 2 * altitudeCm * Math.tan(hFovRad / 2);
-  const cmPerPx = sceneWidthCm / imageWidthPx;
-
-  // Estimated disc diameter in pixels at this altitude
-  const discDiamPx = discRadiusPx * 2;
-  const discDiamCm = discDiamPx * cmPerPx;
-
-  // Use actual disc size if detection seems reasonable, otherwise use known size
-  const travelDistCm =
-    discDiamCm > 5 && discDiamCm < 60 ? discDiamCm : DISC_DIAMETER_CM;
-
-  const speedCmPerSec = travelDistCm / durationSec;
+  const sceneWidthCm = 2 * CAMERA_HEIGHT_CM * Math.tan(hFovRad / 2);
+  // disc travels its own diameter across the sensor
+  const speedCmPerSec = DISC_DIAMETER_CM / durationSec;
   return Math.round(speedCmPerSec * 0.0223694 * 10) / 10;
 }
 
-function estimateSpinRpm(
-  angleDeltaDeg: number,
-  darkFrameCount: number,
-  fps: number
-): number {
-  const durationSec = darkFrameCount / fps;
-  const rotationsPerSec = Math.abs(angleDeltaDeg) / 360 / durationSec;
-  return Math.round(rotationsPerSec * 60);
+function spinRpm(angleDelta: number, darkFrames: number, fps: number): number {
+  const durationSec = Math.max(darkFrames, 1) / fps;
+  return Math.round(Math.abs(angleDelta) / 360 / durationSec * 60);
 }
 
 export default function CameraScreen() {
@@ -93,209 +56,191 @@ export default function CameraScreen() {
 
   const [phase, setPhase] = useState<Phase>('idle');
   const [result, setResult] = useState<Result | null>(null);
+  const [debug, setDebug] = useState<DebugInfo>({ brightness: 0, baseline: 0, fps: 0, workletsOk: workletsAvailable });
   const pulseAnim = useRef(new Animated.Value(1)).current;
   const resultTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  // Refs shared with frame processor worklet
   const isReadyRef = useRef(false);
+  const baselineRef = useRef(-1);
+  const calibCountRef = useRef(0);
+  const darkCountRef = useRef(0);
+  const inEventRef = useRef(false);
+  const angleDeltaRef = useRef(0);
+  const lastAngleRef = useRef<number | null>(null);
 
-  // Detection state (shared with worklet via refs)
-  const baselineBrightness = useRef<number>(-1);
-  const darkFrameCount = useRef(0);
-  const totalAngleDelta = useRef(0);
-  const lastAngle = useRef<number | null>(null);
-  const maxDiscRadius = useRef(0);
-  const frameWidth = useRef(1920);
-  const calibrationFrames = useRef(0);
-  const inDiscEvent = useRef(false);
+  useEffect(() => { if (!hasPermission) requestPermission(); }, [hasPermission, requestPermission]);
 
-  useEffect(() => {
-    if (!hasPermission) requestPermission();
-  }, [hasPermission, requestPermission]);
-
-  // Pulse animation
   useEffect(() => {
     if (phase === 'ready') {
-      Animated.loop(
-        Animated.sequence([
-          Animated.timing(pulseAnim, { toValue: 1.15, duration: 700, useNativeDriver: true }),
-          Animated.timing(pulseAnim, { toValue: 1, duration: 700, useNativeDriver: true }),
-        ])
-      ).start();
+      Animated.loop(Animated.sequence([
+        Animated.timing(pulseAnim, { toValue: 1.15, duration: 700, useNativeDriver: true }),
+        Animated.timing(pulseAnim, { toValue: 1, duration: 700, useNativeDriver: true }),
+      ])).start();
     } else {
       pulseAnim.setValue(1);
     }
   }, [phase, pulseAnim]);
 
-  // Called from frame processor when a disc event is complete
-  const onDiscEvent = useCallback(
-    (darkFrames: number, angleDelta: number, discRadius: number, fps: number, imgWidth: number) => {
-      if (phase !== 'ready' && phase !== 'detecting') return;
+  // Update debug display (called from worklet via runOnJS)
+  const updateDebug = useCallback((brightness: number, baseline: number, fps: number) => {
+    setDebug({ brightness: Math.round(brightness), baseline: Math.round(baseline), fps, workletsOk: true });
+  }, []);
 
-      const speedMph = estimateSpeedMph(darkFrames, fps, imgWidth, discRadius);
-      const spinRpm = estimateSpinRpm(angleDelta, darkFrames, fps);
+  // Called from worklet when disc event is complete
+  const onDisc = useCallback((darkFrames: number, angleDelta: number, fps: number) => {
+    if (!isReadyRef.current) return;
+    isReadyRef.current = false;
 
-      // Sanity check — a disc golf throw is 20-100mph, spin 200-1500rpm
-      if (speedMph < 5 || speedMph > 120) return;
+    const mph = speedMph(darkFrames, fps);
+    const rpm = spinRpm(angleDelta, darkFrames, fps);
 
-      setResult({ speedMph, spinRpm });
-      setPhase('result');
-      saveThrow(speedMph, spinRpm);
-      isReadyRef.current = false;
+    // Sanity check
+    if (mph < 3 || mph > 130) {
+      // Out of range — reset and wait for next throw
+      isReadyRef.current = true;
+      return;
+    }
 
-      Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
-      Speech.speak(
-        `${speedMph} miles per hour. ${spinRpm > 0 ? spinRpm + ' RPM.' : ''}`,
-        { rate: 0.95, pitch: 1.0 }
-      );
+    setResult({ speedMph: mph, spinRpm: rpm });
+    setPhase('result');
+    saveThrow(mph, rpm);
+    Haptics.notificationAsync(Haptics.NotificationFeedbackType.Success);
+    Speech.speak(`${mph} miles per hour. ${rpm} R P M.`, { rate: 0.9 });
 
-      resultTimeoutRef.current = setTimeout(() => {
-        baselineBrightness.current = -1;
-        calibrationFrames.current = 0;
-        darkFrameCount.current = 0;
-        inDiscEvent.current = false;
-        setPhase('ready');
-        isReadyRef.current = true;
-      }, 4000);
-    },
-    [phase]
-  );
+    resultTimeoutRef.current = setTimeout(() => {
+      baselineRef.current = -1;
+      calibCountRef.current = 0;
+      darkCountRef.current = 0;
+      inEventRef.current = false;
+      setPhase('ready');
+      isReadyRef.current = true;
+    }, 4000);
+  }, []);
 
-  // ─── Frame processor (only active when worklets-core is in native binary) ──
-  // Runs on every camera frame at full frame rate.
-  // Algorithm:
-  //   1. Calibrate: average brightness of first 30 frames = baseline (open sky/ceiling)
-  //   2. Each frame: sample center horizontal strip brightness
-  //   3. If brightness drops > threshold → disc is over camera → dark frame
-  //   4. Track consecutive dark frames + edge angle change (for spin)
-  //   5. When dark frames end → disc has passed → report result
-  const frameProcessor = useFrameProcessor(
-    (frame) => {
-      'worklet';
-      // Guard: if worklets-core isn't in the native binary, skip all processing
-      if (!workletsAvailable) return;
-      if (!isReadyRef.current) return;
+  // ── Frame processor ─────────────────────────────────────────────────────────
+  // Samples brightness from the center strip of each camera frame.
+  // Android frames are YUV_420_888: Y (luminance) plane is first, 1 byte/pixel.
+  // iOS frames may be BGRA: luminance = 0.299R + 0.587G + 0.114B.
+  const frameProcessor = useFrameProcessor((frame) => {
+    'worklet';
+    if (!isReadyRef.current) return;
 
-      const width = frame.width;
-      const height = frame.height;
+    const w = frame.width;
+    const h = frame.height;
+    const fps = format?.maxFps ?? 30;
 
-      // Sample a horizontal strip through the center (10% of height)
-      const stripTop = Math.floor(height * 0.45);
-      const stripBot = Math.floor(height * 0.55);
-      const step = 8; // sample every 8th pixel for speed
+    let brightness = 0;
+    let count = 0;
+    let leftX = w;
+    let rightX = 0;
 
-      let brightness = 0;
-      let count = 0;
-      let leftEdgeX = width;
-      let rightEdgeX = 0;
+    try {
+      const buf = frame.toArrayBuffer();
+      const pixels = new Uint8Array(buf);
+      const bufLen = pixels.length;
 
-      try {
-        // Access raw pixel data
-        const buffer = frame.toArrayBuffer();
-        const pixels = new Uint8Array(buffer);
+      // Detect pixel format from buffer size:
+      // YUV_420_888 → bufLen ≈ w*h*1.5  (Y plane is w*h bytes)
+      // BGRA/RGBA   → bufLen ≈ w*h*4
+      const isYUV = bufLen < w * h * 2;
+      const stride = isYUV ? 1 : 4;
 
-        for (let y = stripTop; y < stripBot; y += 2) {
-          for (let x = 0; x < width; x += step) {
-            const i = (y * width + x) * 4; // RGBA
-            const lum = pixels[i] * 0.299 + pixels[i + 1] * 0.587 + pixels[i + 2] * 0.114;
-            brightness += lum;
-            count++;
+      // Sample the center 20% horizontal strip
+      const top = Math.floor(h * 0.4);
+      const bot = Math.floor(h * 0.6);
+      const step = 6;
 
-            // Track dark pixels to find disc edges (for radius estimation)
-            if (lum < 80) {
-              if (x < leftEdgeX) leftEdgeX = x;
-              if (x > rightEdgeX) rightEdgeX = x;
-            }
-          }
-        }
-      } catch {
-        // frame.toArrayBuffer() not available — skip this frame
-        return;
-      }
-
-      if (count === 0) return;
-      const avgBrightness = brightness / count;
-      frameWidth.current = width;
-
-      // ── Phase 1: Calibration ──────────────────────────────────────────────
-      if (baselineBrightness.current < 0) {
-        // Running average of first 30 frames to set baseline
-        if (calibrationFrames.current === 0) {
-          baselineBrightness.current = avgBrightness;
-        } else {
-          baselineBrightness.current =
-            (baselineBrightness.current * calibrationFrames.current + avgBrightness) /
-            (calibrationFrames.current + 1);
-        }
-        calibrationFrames.current++;
-        if (calibrationFrames.current < 30) return; // still calibrating
-      }
-
-      const isDark = avgBrightness < baselineBrightness.current - BRIGHTNESS_DROP_THRESHOLD;
-
-      // ── Phase 2: Disc detection ───────────────────────────────────────────
-      if (isDark) {
-        if (!inDiscEvent.current) {
-          inDiscEvent.current = true;
-          darkFrameCount.current = 0;
-          totalAngleDelta.current = 0;
-          lastAngle.current = null;
-          maxDiscRadius.current = 0;
-        }
-
-        darkFrameCount.current++;
-
-        // Track disc radius from edge positions
-        if (rightEdgeX > leftEdgeX) {
-          const radius = (rightEdgeX - leftEdgeX) / 2;
-          if (radius > maxDiscRadius.current) maxDiscRadius.current = radius;
-
-          // Estimate edge angle (for spin) from blob shape
-          if (lastAngle.current !== null) {
-            // Centroid x shift gives us horizontal motion + spin angle proxy
-            const centerX = (leftEdgeX + rightEdgeX) / 2;
-            const angle = Math.atan2(stripBot - stripTop, centerX) * (180 / Math.PI);
-            let delta = angle - lastAngle.current;
-            if (delta > 180) delta -= 360;
-            if (delta < -180) delta += 360;
-            totalAngleDelta.current += delta;
-            lastAngle.current = angle;
+      for (let y = top; y < bot; y += 2) {
+        for (let x = 0; x < w; x += step) {
+          let lum: number;
+          if (isYUV) {
+            const idx = y * w + x;
+            if (idx >= bufLen) continue;
+            lum = pixels[idx];
           } else {
-            const centerX = (leftEdgeX + rightEdgeX) / 2;
-            lastAngle.current = Math.atan2(stripBot - stripTop, centerX) * (180 / Math.PI);
+            const idx = (y * w + x) * stride;
+            if (idx + 2 >= bufLen) continue;
+            lum = pixels[idx] * 0.114 + pixels[idx + 1] * 0.587 + pixels[idx + 2] * 0.299;
+          }
+          brightness += lum;
+          count++;
+          if (lum < 60) {
+            if (x < leftX) leftX = x;
+            if (x > rightX) rightX = x;
           }
         }
-
-        // Safety: if disc event goes on too long it's probably a shadow, not a disc
-        if (darkFrameCount.current > MAX_DISC_FRAMES) {
-          inDiscEvent.current = false;
-          darkFrameCount.current = 0;
-          baselineBrightness.current = -1; // force recalibration
-          calibrationFrames.current = 0;
-        }
-      } else if (inDiscEvent.current && darkFrameCount.current >= MIN_DARK_FRAMES) {
-        // Disc has passed! Report results.
-        inDiscEvent.current = false;
-        const fps = format?.maxFps ?? 30;
-        runOnJS(onDiscEvent)(
-          darkFrameCount.current,
-          totalAngleDelta.current,
-          maxDiscRadius.current,
-          fps,
-          width
-        );
-      } else {
-        // Brief dark blip (noise) — reset
-        inDiscEvent.current = false;
-        darkFrameCount.current = 0;
       }
-    },
-    [isReadyRef, format, onDiscEvent]
-  );
+    } catch {
+      return; // frame.toArrayBuffer() failed — older device or wrong native binary
+    }
+
+    if (count === 0) return;
+    const avg = brightness / count;
+
+    // ── Calibration: build baseline over first 40 frames ──────────────────────
+    if (baselineRef.current < 0 || calibCountRef.current < 40) {
+      if (calibCountRef.current === 0) {
+        baselineRef.current = avg;
+      } else {
+        baselineRef.current = (baselineRef.current * calibCountRef.current + avg) / (calibCountRef.current + 1);
+      }
+      calibCountRef.current++;
+      runOnJS(updateDebug)(avg, baselineRef.current, fps);
+      return;
+    }
+
+    // Update debug display every 10 frames to avoid flooding
+    if (darkCountRef.current === 0) {
+      runOnJS(updateDebug)(avg, baselineRef.current, fps);
+    }
+
+    const isDark = avg < baselineRef.current - DROP_THRESHOLD;
+
+    if (isDark) {
+      if (!inEventRef.current) {
+        inEventRef.current = true;
+        darkCountRef.current = 0;
+        angleDeltaRef.current = 0;
+        lastAngleRef.current = null;
+      }
+      darkCountRef.current++;
+
+      // Track edge angle for spin estimation
+      if (rightX > leftX) {
+        const centerX = (leftX + rightX) / 2;
+        const angle = (centerX / w) * 180; // map x position to angle proxy
+        if (lastAngleRef.current !== null) {
+          let d = angle - lastAngleRef.current;
+          if (d > 90) d -= 180;
+          if (d < -90) d += 180;
+          angleDeltaRef.current += d;
+        }
+        lastAngleRef.current = angle;
+      }
+
+      // Too many dark frames = shadow or obstruction, not a disc
+      if (darkCountRef.current > MAX_DARK_FRAMES) {
+        inEventRef.current = false;
+        darkCountRef.current = 0;
+        baselineRef.current = -1;
+        calibCountRef.current = 0;
+      }
+    } else if (inEventRef.current) {
+      if (darkCountRef.current >= MIN_DARK_FRAMES) {
+        // Disc passed! Fire result.
+        runOnJS(onDisc)(darkCountRef.current, angleDeltaRef.current, fps);
+      }
+      inEventRef.current = false;
+      darkCountRef.current = 0;
+    }
+  }, [isReadyRef, format, onDisc, updateDebug]);
 
   const startReady = () => {
-    baselineBrightness.current = -1;
-    calibrationFrames.current = 0;
-    darkFrameCount.current = 0;
-    inDiscEvent.current = false;
+    baselineRef.current = -1;
+    calibCountRef.current = 0;
+    darkCountRef.current = 0;
+    inEventRef.current = false;
     if (resultTimeoutRef.current) clearTimeout(resultTimeoutRef.current);
     setResult(null);
     setPhase('ready');
@@ -307,11 +252,10 @@ export default function CameraScreen() {
     setPhase('idle');
   };
 
-  // Dev-only simulated throw
   const simulateThrow = useCallback(() => {
-    if (phase !== 'ready') return;
-    runOnJS(onDiscEvent)(8, 180, 90, format?.maxFps ?? 30, 1920);
-  }, [phase, onDiscEvent, format]);
+    if (!isReadyRef.current) return;
+    onDisc(3, 180, format?.maxFps ?? 30);
+  }, [onDisc, format]);
 
   if (!hasPermission) {
     return (
@@ -325,20 +269,15 @@ export default function CameraScreen() {
   }
 
   if (!device) {
-    return (
-      <View style={styles.permBox}>
-        <Text style={styles.permText}>No camera found.</Text>
-      </View>
-    );
+    return <View style={styles.permBox}><Text style={styles.permText}>No camera found.</Text></View>;
   }
 
   return (
     <View style={styles.container}>
       <Camera
-        ref={undefined}
         style={StyleSheet.absoluteFill}
         device={device}
-        isActive={phase === 'ready' || phase === 'detecting'}
+        isActive={phase === 'ready'}
         format={format}
         fps={format?.maxFps ?? 30}
         frameProcessor={workletsAvailable ? frameProcessor : undefined}
@@ -349,9 +288,7 @@ export default function CameraScreen() {
 
       <View style={styles.overlay}>
         <View style={styles.header}>
-          <Text style={styles.appName}>
-            HYZER<Text style={{ color: colors.cyan }}>TECH</Text>
-          </Text>
+          <Text style={styles.appName}>HYZER<Text style={{ color: colors.cyan }}>TECH</Text></Text>
         </View>
 
         <View style={styles.center}>
@@ -366,19 +303,31 @@ export default function CameraScreen() {
             </View>
           )}
 
-          {(phase === 'ready' || phase === 'detecting') && (
+          {phase === 'ready' && (
             <View style={styles.readyBox}>
-              <Animated.View
-                style={[styles.pulseRing, { transform: [{ scale: pulseAnim }] }]}
-              />
-              <Text style={styles.readyText}>
-                {phase === 'detecting' ? 'MEASURING...' : 'READY'}
-              </Text>
-              <Text style={styles.readySubText}>
-                {phase === 'detecting'
-                  ? 'Disc detected!'
-                  : 'Throw the disc over the camera'}
-              </Text>
+              <Animated.View style={[styles.pulseRing, { transform: [{ scale: pulseAnim }] }]} />
+              <Text style={styles.readyText}>READY</Text>
+              <Text style={styles.readySubText}>Throw the disc over the camera</Text>
+
+              {/* Debug panel — shows live brightness readings */}
+              <View style={styles.debugBox}>
+                <Text style={styles.debugTitle}>SENSOR DEBUG</Text>
+                <Text style={styles.debugRow}>
+                  Worklets: <Text style={{ color: debug.workletsOk ? colors.green : colors.red }}>
+                    {debug.workletsOk ? '✓ active' : '✗ not available'}
+                  </Text>
+                </Text>
+                <Text style={styles.debugRow}>Brightness: <Text style={styles.debugVal}>{debug.brightness}</Text></Text>
+                <Text style={styles.debugRow}>Baseline:   <Text style={styles.debugVal}>{debug.baseline}</Text></Text>
+                <Text style={styles.debugRow}>Drop needed: <Text style={styles.debugVal}>{DROP_THRESHOLD}+</Text></Text>
+                <Text style={styles.debugRow}>FPS: <Text style={styles.debugVal}>{debug.fps}</Text></Text>
+                <Text style={[styles.debugRow, { color: colors.gray, marginTop: 4, fontSize: 11 }]}>
+                  {debug.baseline > 0 && debug.brightness > 0
+                    ? `Current drop: ${debug.baseline - debug.brightness} (need ${DROP_THRESHOLD}+)`
+                    : calibCountRef.current < 40 ? 'Calibrating...' : 'Waiting for disc'}
+                </Text>
+              </View>
+
               <TouchableOpacity style={styles.simBtn} onPress={simulateThrow}>
                 <Text style={styles.simBtnText}>Simulate Throw (dev)</Text>
               </TouchableOpacity>
@@ -419,26 +368,22 @@ const styles = StyleSheet.create({
   instruction: { color: colors.white, fontSize: 18, textAlign: 'center', lineHeight: 26, marginBottom: 40 },
   startBtn: { backgroundColor: colors.cyan, borderRadius: 50, paddingHorizontal: 60, paddingVertical: 18 },
   startBtnText: { color: colors.bg, fontSize: 20, fontWeight: '900', letterSpacing: 3 },
-  readyBox: { alignItems: 'center' },
-  pulseRing: {
-    width: 160, height: 160, borderRadius: 80,
-    borderWidth: 3, borderColor: colors.cyan,
-    marginBottom: -80, opacity: 0.5,
+  readyBox: { alignItems: 'center', width: '100%', paddingHorizontal: 24 },
+  pulseRing: { width: 120, height: 120, borderRadius: 60, borderWidth: 3, borderColor: colors.cyan, marginBottom: -60, opacity: 0.5 },
+  readyText: { color: colors.cyan, fontSize: 36, fontWeight: '900', letterSpacing: 6, marginBottom: 4 },
+  readySubText: { color: colors.gray, fontSize: 13, marginBottom: 16 },
+  debugBox: {
+    backgroundColor: colors.bgCard, borderRadius: 12, padding: 14,
+    borderWidth: 1, borderColor: colors.grayDark, width: '100%', marginBottom: 16,
   },
-  readyText: { color: colors.cyan, fontSize: 36, fontWeight: '900', letterSpacing: 6, marginBottom: 8 },
-  readySubText: { color: colors.gray, fontSize: 14, marginBottom: 40 },
-  simBtn: {
-    borderWidth: 1, borderColor: colors.grayDark, borderRadius: 8,
-    paddingHorizontal: 20, paddingVertical: 10, marginBottom: 16,
-  },
+  debugTitle: { color: colors.cyan, fontSize: 10, letterSpacing: 3, marginBottom: 8, fontWeight: '700' },
+  debugRow: { color: colors.white, fontSize: 13, fontFamily: 'Courier New', marginBottom: 2 },
+  debugVal: { color: colors.cyanLight, fontWeight: '700' },
+  simBtn: { borderWidth: 1, borderColor: colors.grayDark, borderRadius: 8, paddingHorizontal: 20, paddingVertical: 10, marginBottom: 12 },
   simBtnText: { color: colors.gray, fontSize: 13 },
   stopBtn: { borderWidth: 1, borderColor: colors.red, borderRadius: 8, paddingHorizontal: 32, paddingVertical: 12 },
   stopBtnText: { color: colors.red, fontWeight: '700', letterSpacing: 2 },
-  resultBox: {
-    alignItems: 'center', backgroundColor: colors.bgCard,
-    borderRadius: 24, paddingVertical: 36, paddingHorizontal: 60,
-    borderWidth: 1, borderColor: colors.cyan,
-  },
+  resultBox: { alignItems: 'center', backgroundColor: colors.bgCard, borderRadius: 24, paddingVertical: 36, paddingHorizontal: 60, borderWidth: 1, borderColor: colors.cyan },
   resultLabel: { color: colors.gray, fontSize: 13, letterSpacing: 4, marginBottom: 4 },
   resultValue: { color: colors.cyanLight, fontSize: 64, fontWeight: '900', lineHeight: 70 },
   resultUnit: { color: colors.cyan, fontSize: 18, letterSpacing: 2, marginBottom: 8 },
