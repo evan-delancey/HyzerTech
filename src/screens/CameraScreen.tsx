@@ -3,31 +3,23 @@ import { StyleSheet, View, Text, TouchableOpacity, Animated, Platform } from 're
 import {
   Camera,
   useCameraDevice,
-  useCameraPermission,
   useCameraFormat,
   useFrameProcessor,
 } from 'react-native-vision-camera';
-import { useRunOnJS } from 'react-native-worklets-core';
+// v3 uses react-native-reanimated for runOnJS (not worklets-core)
+import { runOnJS } from 'react-native-reanimated';
 import * as Speech from 'expo-speech';
 import * as Haptics from 'expo-haptics';
 import { colors } from '../lib/theme';
 import { saveThrow } from '../lib/db';
 
-const APP_VERSION = '0.1.0';
-
-let workletsAvailable = false;
-try {
-  require('react-native-worklets-core');
-  workletsAvailable = true;
-} catch {
-  workletsAvailable = false;
-}
+const APP_VERSION = '0.1.1';
 
 type Phase = 'idle' | 'ready' | 'result';
 interface Result { speedMph: number; spinRpm: number; }
 interface DebugInfo {
   brightness: number; baseline: number; fps: number;
-  bufLen: number; frameW: number; frameH: number; workletsOk: boolean; bpr: number;
+  bufLen: number; frameW: number; frameH: number; bpr: number;
 }
 
 const DISC_DIAMETER_CM = 21.2;
@@ -51,30 +43,30 @@ function calcSpinRpm(angleDelta: number, darkFrames: number, fps: number): numbe
 
 export default function CameraScreen() {
   const device = useCameraDevice('back');
-  const format = useCameraFormat(device, [
-    { fps: 120 }, { fps: 60 }, { fps: 30 },
-  ]);
-  const { hasPermission, requestPermission } = useCameraPermission();
+  const format = useCameraFormat(device, [{ fps: 120 }, { fps: 60 }, { fps: 30 }]);
+  // v3 permission hook
+  const [hasPermission, setHasPermission] = useState(false);
 
   const [phase, setPhase] = useState<Phase>('idle');
   const [result, setResult] = useState<Result | null>(null);
-  const [debug, setDebug] = useState<DebugInfo>({
-    brightness: 0, baseline: 0, fps: 0,
-    bufLen: 0, frameW: 0, frameH: 0, workletsOk: workletsAvailable, bpr: 0,
-  });
+  const [debug, setDebug] = useState<DebugInfo>({ brightness: 0, baseline: 0, fps: 0, bufLen: 0, frameW: 0, frameH: 0, bpr: 0 });
   const pulseAnim = useRef(new Animated.Value(1)).current;
   const resultTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Plain refs — worklets-core can access these via JSI closure
-  const isReady = useRef(false);
-  const baseline = useRef(-1);
-  const calibCount = useRef(0);
-  const darkCount = useRef(0);
-  const inEvent = useRef(false);
-  const angleDelta = useRef(0);
-  const lastAngle = useRef(-1);
+  // Plain refs — accessible from worklet via closure
+  const isReadyRef = useRef(false);
+  const baselineRef = useRef(-1);
+  const calibCountRef = useRef(0);
+  const darkCountRef = useRef(0);
+  const inEventRef = useRef(false);
+  const angleDeltaRef = useRef(0);
+  const lastAngleRef = useRef(-1);
 
-  useEffect(() => { if (!hasPermission) requestPermission(); }, [hasPermission, requestPermission]);
+  useEffect(() => {
+    Camera.requestCameraPermission().then(status => {
+      setHasPermission(status === 'granted');
+    });
+  }, []);
 
   useEffect(() => {
     if (phase === 'ready') {
@@ -87,34 +79,21 @@ export default function CameraScreen() {
     }
   }, [phase, pulseAnim]);
 
-  // useRunOnJS: creates worklet-callable functions that hop back to JS thread
-  const updateDebug = useRunOnJS((
+  const updateDebug = useCallback((
     brightness: number, base: number, fps: number,
     bufLen: number, fw: number, fh: number, bpr: number
   ) => {
-    setDebug({
-      brightness: Math.round(brightness),
-      baseline: Math.round(base),
-      fps,
-      bufLen,
-      frameW: fw,
-      frameH: fh,
-      workletsOk: true,
-      bpr,
-    });
+    setDebug({ brightness: Math.round(brightness), baseline: Math.round(base), fps, bufLen, frameW: fw, frameH: fh, bpr });
   }, []);
 
-  const onDisc = useRunOnJS((darkFrames: number, angle: number, fps: number) => {
-    if (!isReady.current) return;
-    isReady.current = false;
+  const onDisc = useCallback((darkFrames: number, angle: number, fps: number) => {
+    if (!isReadyRef.current) return;
+    isReadyRef.current = false;
 
     const mph = calcSpeedMph(darkFrames, fps);
     const rpm = calcSpinRpm(angle, darkFrames, fps);
 
-    if (mph < 3 || mph > 130) {
-      isReady.current = true;
-      return;
-    }
+    if (mph < 3 || mph > 130) { isReadyRef.current = true; return; }
 
     setResult({ speedMph: mph, spinRpm: rpm });
     setPhase('result');
@@ -123,28 +102,26 @@ export default function CameraScreen() {
     Speech.speak(`${mph} miles per hour. ${rpm} R P M.`, { rate: 0.9 });
 
     resultTimeoutRef.current = setTimeout(() => {
-      baseline.current = -1;
-      calibCount.current = 0;
-      darkCount.current = 0;
-      inEvent.current = false;
+      baselineRef.current = -1;
+      calibCountRef.current = 0;
+      darkCountRef.current = 0;
+      inEventRef.current = false;
       setPhase('ready');
-      isReady.current = true;
+      isReadyRef.current = true;
     }, 4000);
   }, []);
 
+  // ── Frame processor (v3 API — uses reanimated runOnJS) ──────────────────────
   const frameProcessor = useFrameProcessor((frame) => {
     'worklet';
 
     const w = frame.width;
     const h = frame.height;
+    const bpr = frame.bytesPerRow;
     const fps = format?.maxFps ?? 30;
 
-    // Always report frame dimensions first so debug shows something
-    const bpr = frame.bytesPerRow;
-    if (!isReady.current) {
-      if (w > 0) {
-        updateDebug(0, 0, fps, frame.isValid ? -2 : -3, w, h, bpr);
-      }
+    if (!isReadyRef.current) {
+      runOnJS(updateDebug)(0, 0, fps, -2, w, h, bpr);
       return;
     }
 
@@ -154,23 +131,19 @@ export default function CameraScreen() {
     let rightX = 0;
     let bufLen = 0;
 
-    // Retain the frame so it isn't released before we access pixel data
-    frame.incrementRefCount();
     try {
       const buf = frame.toArrayBuffer();
       const pixels = new Uint8Array(buf);
       bufLen = pixels.length;
 
       if (bufLen === 0) {
-        updateDebug(0, baseline.current, fps, 0, w, h, bpr);
+        runOnJS(updateDebug)(0, baselineRef.current, fps, 0, w, h, bpr);
         return;
       }
 
-      // Determine pixel format from buffer size
-      // YUV_420: bufLen ≈ w*h*1.5  →  Y plane is 1 byte/px
-      // BGRA:    bufLen ≈ w*h*4    →  4 bytes/px
+      // YUV_420: bufLen ≈ w*h*1.5 | BGRA: bufLen ≈ w*h*4
       const isYUV = bufLen < w * h * 2;
-      const yStride = isYUV ? Math.round(bufLen / (h * 1.5)) : w * 4;
+      const yStride = isYUV ? (bpr > 0 ? bpr : w) : w * 4;
 
       const top = Math.floor(h * 0.4);
       const bot = Math.floor(h * 0.6);
@@ -183,7 +156,6 @@ export default function CameraScreen() {
             if (idx >= bufLen) continue;
             lum = pixels[idx];
           } else {
-            // BGRA (iOS rgb mode) or RGBA
             const idx = (y * w + x) * 4;
             if (idx + 2 >= bufLen) continue;
             lum = pixels[idx + 2] * 0.299 + pixels[idx + 1] * 0.587 + pixels[idx] * 0.114;
@@ -197,83 +169,75 @@ export default function CameraScreen() {
         }
       }
     } catch {
-      frame.decrementRefCount();
-      updateDebug(-1, baseline.current, fps, -1, w, h, bpr);
+      runOnJS(updateDebug)(-1, baselineRef.current, fps, -1, w, h, bpr);
       return;
     }
-    frame.decrementRefCount();
 
     if (count === 0) return;
     const avg = brightness / count;
 
-    // ── Calibration ──────────────────────────────────────────────────────────
-    if (baseline.current < 0 || calibCount.current < 40) {
-      if (calibCount.current === 0) {
-        baseline.current = avg;
-      } else {
-        baseline.current = (baseline.current * calibCount.current + avg) / (calibCount.current + 1);
-      }
-      calibCount.current = calibCount.current + 1;
-      updateDebug(avg, baseline.current, fps, bufLen, w, h, bpr);
+    // Calibration
+    if (baselineRef.current < 0 || calibCountRef.current < 40) {
+      baselineRef.current = calibCountRef.current === 0
+        ? avg
+        : (baselineRef.current * calibCountRef.current + avg) / (calibCountRef.current + 1);
+      calibCountRef.current = calibCountRef.current + 1;
+      runOnJS(updateDebug)(avg, baselineRef.current, fps, bufLen, w, h, bpr);
       return;
     }
 
-    // ── Detection ─────────────────────────────────────────────────────────────
-    updateDebug(avg, baseline.current, fps, bufLen, w, h, bpr);
+    runOnJS(updateDebug)(avg, baselineRef.current, fps, bufLen, w, h, bpr);
 
-    const isDark = avg < baseline.current - DROP_THRESHOLD;
+    const isDark = avg < baselineRef.current - DROP_THRESHOLD;
 
     if (isDark) {
-      if (!inEvent.current) {
-        inEvent.current = true;
-        darkCount.current = 0;
-        angleDelta.current = 0;
-        lastAngle.current = -1;
+      if (!inEventRef.current) {
+        inEventRef.current = true;
+        darkCountRef.current = 0;
+        angleDeltaRef.current = 0;
+        lastAngleRef.current = -1;
       }
-      darkCount.current = darkCount.current + 1;
+      darkCountRef.current = darkCountRef.current + 1;
 
       if (rightX > leftX) {
         const cx = (leftX + rightX) / 2;
         const angle = (cx / w) * 180;
-        if (lastAngle.current >= 0) {
-          let d = angle - lastAngle.current;
+        if (lastAngleRef.current >= 0) {
+          let d = angle - lastAngleRef.current;
           if (d > 90) d -= 180;
           if (d < -90) d += 180;
-          angleDelta.current = angleDelta.current + d;
+          angleDeltaRef.current = angleDeltaRef.current + d;
         }
-        lastAngle.current = angle;
+        lastAngleRef.current = angle;
       }
 
-      if (darkCount.current > MAX_DARK_FRAMES) {
-        inEvent.current = false;
-        darkCount.current = 0;
-        baseline.current = -1;
-        calibCount.current = 0;
+      if (darkCountRef.current > MAX_DARK_FRAMES) {
+        inEventRef.current = false;
+        darkCountRef.current = 0;
+        baselineRef.current = -1;
+        calibCountRef.current = 0;
       }
-    } else if (inEvent.current) {
-      if (darkCount.current >= 1) {
-        onDisc(darkCount.current, angleDelta.current, fps);
+    } else if (inEventRef.current) {
+      if (darkCountRef.current >= 1) {
+        runOnJS(onDisc)(darkCountRef.current, angleDeltaRef.current, fps);
       }
-      inEvent.current = false;
-      darkCount.current = 0;
+      inEventRef.current = false;
+      darkCountRef.current = 0;
     }
-  }, [isReady, baseline, calibCount, darkCount, inEvent, angleDelta, lastAngle, format, onDisc, updateDebug]);
+  }, [format, updateDebug, onDisc]);
 
   const startReady = () => {
-    baseline.current = -1;
-    calibCount.current = 0;
-    darkCount.current = 0;
-    inEvent.current = false;
+    baselineRef.current = -1;
+    calibCountRef.current = 0;
+    darkCountRef.current = 0;
+    inEventRef.current = false;
     if (resultTimeoutRef.current) clearTimeout(resultTimeoutRef.current);
     setResult(null);
     setPhase('ready');
-    isReady.current = true;
+    isReadyRef.current = true;
   };
 
-  const stopReady = () => {
-    isReady.current = false;
-    setPhase('idle');
-  };
+  const stopReady = () => { isReadyRef.current = false; setPhase('idle'); };
 
   const simulateThrow = useCallback(() => {
     onDisc(3, 180, format?.maxFps ?? 30);
@@ -283,7 +247,9 @@ export default function CameraScreen() {
     return (
       <View style={styles.permBox}>
         <Text style={styles.permText}>Camera permission required.</Text>
-        <TouchableOpacity style={styles.btn} onPress={requestPermission}>
+        <TouchableOpacity style={styles.btn} onPress={() =>
+          Camera.requestCameraPermission().then(s => setHasPermission(s === 'granted'))
+        }>
           <Text style={styles.btnText}>Grant Permission</Text>
         </TouchableOpacity>
       </View>
@@ -299,10 +265,10 @@ export default function CameraScreen() {
         isActive={phase === 'ready'}
         format={format}
         fps={format?.maxFps ?? 30}
-        frameProcessor={workletsAvailable ? frameProcessor : undefined}
-        pixelFormat="yuv"
+        frameProcessor={frameProcessor}
+        pixelFormat={Platform.OS === 'ios' ? 'rgb' : 'yuv'}
         photo={false}
-        video={true}
+        video={false}
         audio={false}
       />
 
@@ -314,9 +280,7 @@ export default function CameraScreen() {
         <View style={styles.center}>
           {phase === 'idle' && (
             <View style={styles.idleBox}>
-              <Text style={styles.instruction}>
-                Place your phone camera-up on the ground, 5 feet in front of where you throw.
-              </Text>
+              <Text style={styles.instruction}>Place your phone camera-up on the ground, 5 feet in front of where you throw.</Text>
               <TouchableOpacity style={styles.startBtn} onPress={startReady}>
                 <Text style={styles.startBtnText}>START</Text>
               </TouchableOpacity>
@@ -331,28 +295,22 @@ export default function CameraScreen() {
 
               <View style={styles.debugBox}>
                 <Text style={styles.debugTitle}>SENSOR DEBUG  v{APP_VERSION}</Text>
-                <Text style={styles.debugRow}>
-                  Worklets: <Text style={{ color: debug.workletsOk ? colors.green : colors.red }}>
-                    {debug.workletsOk ? '✓ active' : '✗ unavailable'}
-                  </Text>
-                </Text>
                 <Text style={styles.debugRow}>Frame: <Text style={styles.debugVal}>{debug.frameW}×{debug.frameH}</Text></Text>
+                <Text style={styles.debugRow}>BytesPerRow: <Text style={styles.debugVal}>{debug.bpr}</Text></Text>
                 <Text style={styles.debugRow}>
                   Buffer: <Text style={styles.debugVal}>
                     {debug.bufLen === 0 ? 'EMPTY ⚠️'
                       : debug.bufLen === -1 ? 'EXCEPTION ⚠️'
-                      : debug.bufLen === -2 ? 'not started'
-                      : debug.bufLen === -3 ? 'invalid frame'
+                      : debug.bufLen === -2 ? 'waiting...'
                       : `${debug.bufLen} bytes ✓`}
                   </Text>
                 </Text>
                 <Text style={styles.debugRow}>Brightness: <Text style={styles.debugVal}>{debug.brightness}</Text></Text>
                 <Text style={styles.debugRow}>Baseline: <Text style={styles.debugVal}>{debug.baseline}</Text></Text>
-                <Text style={styles.debugRow}>BytesPerRow: <Text style={styles.debugVal}>{debug.bpr}</Text></Text>
                 <Text style={styles.debugRow}>FPS: <Text style={styles.debugVal}>{debug.fps}</Text></Text>
                 <Text style={[styles.debugRow, { color: colors.gray, marginTop: 4, fontSize: 11 }]}>
                   {debug.bufLen <= 0
-                    ? 'No pixel data — check pixelFormat'
+                    ? 'No pixel data yet'
                     : debug.baseline > 0
                     ? `Drop: ${debug.baseline - debug.brightness} (trigger at ${DROP_THRESHOLD}+)`
                     : 'Calibrating...'}
