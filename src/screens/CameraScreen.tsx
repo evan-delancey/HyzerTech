@@ -13,7 +13,7 @@ import * as Haptics from 'expo-haptics';
 import { colors } from '../lib/theme';
 import { saveThrow } from '../lib/db';
 
-const APP_VERSION = '0.0.8';
+const APP_VERSION = '0.0.9';
 
 let workletsAvailable = false;
 try {
@@ -27,7 +27,7 @@ type Phase = 'idle' | 'ready' | 'result';
 interface Result { speedMph: number; spinRpm: number; }
 interface DebugInfo {
   brightness: number; baseline: number; fps: number;
-  bufLen: number; frameW: number; frameH: number; workletsOk: boolean;
+  bufLen: number; frameW: number; frameH: number; workletsOk: boolean; bpr: number;
 }
 
 const DISC_DIAMETER_CM = 21.2;
@@ -64,7 +64,7 @@ export default function CameraScreen() {
   const [result, setResult] = useState<Result | null>(null);
   const [debug, setDebug] = useState<DebugInfo>({
     brightness: 0, baseline: 0, fps: 0,
-    bufLen: 0, frameW: 0, frameH: 0, workletsOk: workletsAvailable,
+    bufLen: 0, frameW: 0, frameH: 0, workletsOk: workletsAvailable, bpr: 0,
   });
   const pulseAnim = useRef(new Animated.Value(1)).current;
   const resultTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -94,7 +94,7 @@ export default function CameraScreen() {
   // useRunOnJS: creates worklet-callable functions that hop back to JS thread
   const updateDebug = useRunOnJS((
     brightness: number, base: number, fps: number,
-    bufLen: number, fw: number, fh: number
+    bufLen: number, fw: number, fh: number, bpr: number
   ) => {
     setDebug({
       brightness: Math.round(brightness),
@@ -104,6 +104,7 @@ export default function CameraScreen() {
       frameW: fw,
       frameH: fh,
       workletsOk: true,
+      bpr,
     });
   }, []);
 
@@ -143,10 +144,10 @@ export default function CameraScreen() {
     const fps = format?.maxFps ?? 30;
 
     // Always report frame dimensions first so debug shows something
+    const bpr = frame.bytesPerRow;
     if (!isReady.current) {
       if (w > 0) {
-        // Pass negative bufLen to signal "not ready yet but frame is valid"
-        updateDebug(0, 0, fps, frame.isValid ? -2 : -3, w, h);
+        updateDebug(0, 0, fps, frame.isValid ? -2 : -3, w, h, bpr);
       }
       return;
     }
@@ -163,7 +164,7 @@ export default function CameraScreen() {
       bufLen = pixels.length;
 
       if (bufLen === 0) {
-        updateDebug(0, baseline.current, fps, 0, w, h);
+        updateDebug(0, baseline.current, fps, 0, w, h, bpr);
         return;
       }
 
@@ -198,7 +199,7 @@ export default function CameraScreen() {
         }
       }
     } catch {
-      updateDebug(-1, baseline.current, fps, -1, w, h);
+      updateDebug(-1, baseline.current, fps, -1, w, h, bpr);
       return;
     }
 
@@ -213,7 +214,7 @@ export default function CameraScreen() {
         baseline.current = (baseline.current * calibCount.current + avg) / (calibCount.current + 1);
       }
       calibCount.current = calibCount.current + 1;
-      updateDebug(avg, baseline.current, fps, bufLen, w, h);
+      updateDebug(avg, baseline.current, fps, bufLen, w, h, bpr);
       return;
     }
 
@@ -301,7 +302,7 @@ export default function CameraScreen() {
         frameProcessor={workletsAvailable ? frameProcessor : undefined}
         pixelFormat="yuv"
         photo={false}
-        video={false}
+        video={true}
         audio={false}
       />
 
@@ -347,6 +348,7 @@ export default function CameraScreen() {
                 </Text>
                 <Text style={styles.debugRow}>Brightness: <Text style={styles.debugVal}>{debug.brightness}</Text></Text>
                 <Text style={styles.debugRow}>Baseline: <Text style={styles.debugVal}>{debug.baseline}</Text></Text>
+                <Text style={styles.debugRow}>BytesPerRow: <Text style={styles.debugVal}>{debug.bpr}</Text></Text>
                 <Text style={styles.debugRow}>FPS: <Text style={styles.debugVal}>{debug.fps}</Text></Text>
                 <Text style={[styles.debugRow, { color: colors.gray, marginTop: 4, fontSize: 11 }]}>
                   {debug.bufLen <= 0
