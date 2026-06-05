@@ -7,13 +7,13 @@ import {
   useCameraFormat,
   useFrameProcessor,
 } from 'react-native-vision-camera';
-import { runOnJS, useSharedValue } from 'react-native-reanimated';
+import { useRunOnJS } from 'react-native-worklets-core';
 import * as Speech from 'expo-speech';
 import * as Haptics from 'expo-haptics';
 import { colors } from '../lib/theme';
 import { saveThrow } from '../lib/db';
 
-const APP_VERSION = '0.0.6';
+const APP_VERSION = '0.0.7';
 
 let workletsAvailable = false;
 try {
@@ -63,14 +63,14 @@ export default function CameraScreen() {
   const pulseAnim = useRef(new Animated.Value(1)).current;
   const resultTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // useSharedValue so worklet thread can read/write these reliably
-  const isReady = useSharedValue(false);
-  const baseline = useSharedValue(-1);
-  const calibCount = useSharedValue(0);
-  const darkCount = useSharedValue(0);
-  const inEvent = useSharedValue(false);
-  const angleDelta = useSharedValue(0);
-  const lastAngle = useSharedValue(-1);
+  // Plain refs — worklets-core can access these via JSI closure
+  const isReady = useRef(false);
+  const baseline = useRef(-1);
+  const calibCount = useRef(0);
+  const darkCount = useRef(0);
+  const inEvent = useRef(false);
+  const angleDelta = useRef(0);
+  const lastAngle = useRef(-1);
 
   useEffect(() => { if (!hasPermission) requestPermission(); }, [hasPermission, requestPermission]);
 
@@ -85,7 +85,8 @@ export default function CameraScreen() {
     }
   }, [phase, pulseAnim]);
 
-  const updateDebug = useCallback((
+  // useRunOnJS: creates worklet-callable functions that hop back to JS thread
+  const updateDebug = useRunOnJS((
     brightness: number, base: number, fps: number,
     bufLen: number, fw: number, fh: number
   ) => {
@@ -100,15 +101,15 @@ export default function CameraScreen() {
     });
   }, []);
 
-  const onDisc = useCallback((darkFrames: number, angle: number, fps: number) => {
-    if (!isReady.value) return;
-    isReady.value = false;
+  const onDisc = useRunOnJS((darkFrames: number, angle: number, fps: number) => {
+    if (!isReady.current) return;
+    isReady.current = false;
 
     const mph = calcSpeedMph(darkFrames, fps);
     const rpm = calcSpinRpm(angle, darkFrames, fps);
 
     if (mph < 3 || mph > 130) {
-      isReady.value = true;
+      isReady.current = true;
       return;
     }
 
@@ -119,12 +120,12 @@ export default function CameraScreen() {
     Speech.speak(`${mph} miles per hour. ${rpm} R P M.`, { rate: 0.9 });
 
     resultTimeoutRef.current = setTimeout(() => {
-      baseline.value = -1;
-      calibCount.value = 0;
-      darkCount.value = 0;
-      inEvent.value = false;
+      baseline.current = -1;
+      calibCount.current = 0;
+      darkCount.current = 0;
+      inEvent.current = false;
       setPhase('ready');
-      isReady.value = true;
+      isReady.current = true;
     }, 4000);
   }, []);
 
@@ -136,9 +137,9 @@ export default function CameraScreen() {
     const fps = format?.maxFps ?? 30;
 
     // Always report frame dimensions first so debug shows something
-    if (!isReady.value) {
+    if (!isReady.current) {
       if (w > 0) {
-        runOnJS(updateDebug)(0, 0, fps, 0, w, h);
+        updateDebug(0, 0, fps, 0, w, h);
       }
       return;
     }
@@ -155,7 +156,7 @@ export default function CameraScreen() {
       bufLen = pixels.length;
 
       if (bufLen === 0) {
-        runOnJS(updateDebug)(0, baseline.value, fps, 0, w, h);
+        updateDebug(0, baseline.current, fps, 0, w, h);
         return;
       }
 
@@ -190,7 +191,7 @@ export default function CameraScreen() {
         }
       }
     } catch {
-      runOnJS(updateDebug)(-1, baseline.value, fps, -1, w, h);
+      updateDebug(-1, baseline.current, fps, -1, w, h);
       return;
     }
 
@@ -198,71 +199,71 @@ export default function CameraScreen() {
     const avg = brightness / count;
 
     // ── Calibration ──────────────────────────────────────────────────────────
-    if (baseline.value < 0 || calibCount.value < 40) {
-      if (calibCount.value === 0) {
-        baseline.value = avg;
+    if (baseline.current < 0 || calibCount.current < 40) {
+      if (calibCount.current === 0) {
+        baseline.current = avg;
       } else {
-        baseline.value = (baseline.value * calibCount.value + avg) / (calibCount.value + 1);
+        baseline.current = (baseline.current * calibCount.current + avg) / (calibCount.current + 1);
       }
-      calibCount.value = calibCount.value + 1;
-      runOnJS(updateDebug)(avg, baseline.value, fps, bufLen, w, h);
+      calibCount.current = calibCount.current + 1;
+      updateDebug(avg, baseline.current, fps, bufLen, w, h);
       return;
     }
 
     // ── Detection ─────────────────────────────────────────────────────────────
-    runOnJS(updateDebug)(avg, baseline.value, fps, bufLen, w, h);
+    updateDebug(avg, baseline.current, fps, bufLen, w, h);
 
-    const isDark = avg < baseline.value - DROP_THRESHOLD;
+    const isDark = avg < baseline.current - DROP_THRESHOLD;
 
     if (isDark) {
-      if (!inEvent.value) {
-        inEvent.value = true;
-        darkCount.value = 0;
-        angleDelta.value = 0;
-        lastAngle.value = -1;
+      if (!inEvent.current) {
+        inEvent.current = true;
+        darkCount.current = 0;
+        angleDelta.current = 0;
+        lastAngle.current = -1;
       }
-      darkCount.value = darkCount.value + 1;
+      darkCount.current = darkCount.current + 1;
 
       if (rightX > leftX) {
         const cx = (leftX + rightX) / 2;
         const angle = (cx / w) * 180;
-        if (lastAngle.value >= 0) {
-          let d = angle - lastAngle.value;
+        if (lastAngle.current >= 0) {
+          let d = angle - lastAngle.current;
           if (d > 90) d -= 180;
           if (d < -90) d += 180;
-          angleDelta.value = angleDelta.value + d;
+          angleDelta.current = angleDelta.current + d;
         }
-        lastAngle.value = angle;
+        lastAngle.current = angle;
       }
 
-      if (darkCount.value > MAX_DARK_FRAMES) {
-        inEvent.value = false;
-        darkCount.value = 0;
-        baseline.value = -1;
-        calibCount.value = 0;
+      if (darkCount.current > MAX_DARK_FRAMES) {
+        inEvent.current = false;
+        darkCount.current = 0;
+        baseline.current = -1;
+        calibCount.current = 0;
       }
-    } else if (inEvent.value) {
-      if (darkCount.value >= 1) {
-        runOnJS(onDisc)(darkCount.value, angleDelta.value, fps);
+    } else if (inEvent.current) {
+      if (darkCount.current >= 1) {
+        onDisc(darkCount.current, angleDelta.current, fps);
       }
-      inEvent.value = false;
-      darkCount.value = 0;
+      inEvent.current = false;
+      darkCount.current = 0;
     }
   }, [isReady, baseline, calibCount, darkCount, inEvent, angleDelta, lastAngle, format, onDisc, updateDebug]);
 
   const startReady = () => {
-    baseline.value = -1;
-    calibCount.value = 0;
-    darkCount.value = 0;
-    inEvent.value = false;
+    baseline.current = -1;
+    calibCount.current = 0;
+    darkCount.current = 0;
+    inEvent.current = false;
     if (resultTimeoutRef.current) clearTimeout(resultTimeoutRef.current);
     setResult(null);
     setPhase('ready');
-    isReady.value = true;
+    isReady.current = true;
   };
 
   const stopReady = () => {
-    isReady.value = false;
+    isReady.current = false;
     setPhase('idle');
   };
 
