@@ -4,16 +4,16 @@ import {
   Camera,
   useCameraDevice,
   useCameraFormat,
+  useCameraPermission,
   useFrameProcessor,
 } from 'react-native-vision-camera';
-// v3 uses react-native-reanimated for runOnJS (not worklets-core)
-import { runOnJS } from 'react-native-reanimated';
+import { useRunOnJS } from 'react-native-worklets-core';
 import * as Speech from 'expo-speech';
 import * as Haptics from 'expo-haptics';
 import { colors } from '../lib/theme';
 import { saveThrow } from '../lib/db';
 
-const APP_VERSION = '0.1.1';
+const APP_VERSION = '0.1.2';
 
 type Phase = 'idle' | 'ready' | 'result';
 interface Result { speedMph: number; spinRpm: number; }
@@ -44,8 +44,7 @@ function calcSpinRpm(angleDelta: number, darkFrames: number, fps: number): numbe
 export default function CameraScreen() {
   const device = useCameraDevice('back');
   const format = useCameraFormat(device, [{ fps: 120 }, { fps: 60 }, { fps: 30 }]);
-  // v3 permission hook
-  const [hasPermission, setHasPermission] = useState(false);
+  const { hasPermission, requestPermission } = useCameraPermission();
 
   const [phase, setPhase] = useState<Phase>('idle');
   const [result, setResult] = useState<Result | null>(null);
@@ -62,11 +61,7 @@ export default function CameraScreen() {
   const angleDeltaRef = useRef(0);
   const lastAngleRef = useRef(-1);
 
-  useEffect(() => {
-    Camera.requestCameraPermission().then(status => {
-      setHasPermission(status === 'granted');
-    });
-  }, []);
+  useEffect(() => { if (!hasPermission) requestPermission(); }, [hasPermission, requestPermission]);
 
   useEffect(() => {
     if (phase === 'ready') {
@@ -79,14 +74,15 @@ export default function CameraScreen() {
     }
   }, [phase, pulseAnim]);
 
-  const updateDebug = useCallback((
+  // useRunOnJS: worklets-core hook that creates worklet-callable JS callbacks
+  const updateDebug = useRunOnJS((
     brightness: number, base: number, fps: number,
     bufLen: number, fw: number, fh: number, bpr: number
   ) => {
     setDebug({ brightness: Math.round(brightness), baseline: Math.round(base), fps, bufLen, frameW: fw, frameH: fh, bpr });
   }, []);
 
-  const onDisc = useCallback((darkFrames: number, angle: number, fps: number) => {
+  const onDisc = useRunOnJS((darkFrames: number, angle: number, fps: number) => {
     if (!isReadyRef.current) return;
     isReadyRef.current = false;
 
@@ -111,7 +107,10 @@ export default function CameraScreen() {
     }, 4000);
   }, []);
 
-  // ── Frame processor (v3 API — uses reanimated runOnJS) ──────────────────────
+  // ── Frame processor ──────────────────────────────────────────────────────────
+  // KEY FIX: call frame.incrementRefCount() before toArrayBuffer() to prevent
+  // the frame buffer from being released before our worklet accesses it.
+  // This fixes the empty buffer issue in vision camera v4 + worklets-core.
   const frameProcessor = useFrameProcessor((frame) => {
     'worklet';
 
@@ -121,9 +120,12 @@ export default function CameraScreen() {
     const fps = format?.maxFps ?? 30;
 
     if (!isReadyRef.current) {
-      runOnJS(updateDebug)(0, 0, fps, -2, w, h, bpr);
+      updateDebug(0, 0, fps, -2, w, h, bpr);
       return;
     }
+
+    // Retain frame so buffer isn't released before toArrayBuffer() executes
+    (frame as any).incrementRefCount();
 
     let brightness = 0;
     let count = 0;
@@ -137,7 +139,8 @@ export default function CameraScreen() {
       bufLen = pixels.length;
 
       if (bufLen === 0) {
-        runOnJS(updateDebug)(0, baselineRef.current, fps, 0, w, h, bpr);
+        (frame as any).decrementRefCount();
+        updateDebug(0, baselineRef.current, fps, 0, w, h, bpr);
         return;
       }
 
@@ -169,9 +172,13 @@ export default function CameraScreen() {
         }
       }
     } catch {
-      runOnJS(updateDebug)(-1, baselineRef.current, fps, -1, w, h, bpr);
+      (frame as any).decrementRefCount();
+      updateDebug(-1, baselineRef.current, fps, -1, w, h, bpr);
       return;
     }
+
+    // Release frame retain now that we have the data
+    (frame as any).decrementRefCount();
 
     if (count === 0) return;
     const avg = brightness / count;
@@ -182,11 +189,11 @@ export default function CameraScreen() {
         ? avg
         : (baselineRef.current * calibCountRef.current + avg) / (calibCountRef.current + 1);
       calibCountRef.current = calibCountRef.current + 1;
-      runOnJS(updateDebug)(avg, baselineRef.current, fps, bufLen, w, h, bpr);
+      updateDebug(avg, baselineRef.current, fps, bufLen, w, h, bpr);
       return;
     }
 
-    runOnJS(updateDebug)(avg, baselineRef.current, fps, bufLen, w, h, bpr);
+    updateDebug(avg, baselineRef.current, fps, bufLen, w, h, bpr);
 
     const isDark = avg < baselineRef.current - DROP_THRESHOLD;
 
@@ -219,7 +226,7 @@ export default function CameraScreen() {
       }
     } else if (inEventRef.current) {
       if (darkCountRef.current >= 1) {
-        runOnJS(onDisc)(darkCountRef.current, angleDeltaRef.current, fps);
+        onDisc(darkCountRef.current, angleDeltaRef.current, fps);
       }
       inEventRef.current = false;
       darkCountRef.current = 0;
@@ -247,9 +254,7 @@ export default function CameraScreen() {
     return (
       <View style={styles.permBox}>
         <Text style={styles.permText}>Camera permission required.</Text>
-        <TouchableOpacity style={styles.btn} onPress={() =>
-          Camera.requestCameraPermission().then(s => setHasPermission(s === 'granted'))
-        }>
+        <TouchableOpacity style={styles.btn} onPress={requestPermission}>
           <Text style={styles.btnText}>Grant Permission</Text>
         </TouchableOpacity>
       </View>
@@ -266,7 +271,7 @@ export default function CameraScreen() {
         format={format}
         fps={format?.maxFps ?? 30}
         frameProcessor={frameProcessor}
-        pixelFormat={Platform.OS === 'ios' ? 'rgb' : 'yuv'}
+        pixelFormat="yuv"
         photo={false}
         video={false}
         audio={false}
