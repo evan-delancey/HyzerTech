@@ -294,6 +294,7 @@ export default function CameraScreen() {
         format={format}
         fps={format?.maxFps ?? 30}
         frameProcessor={workletsAvailable ? frameProcessor : undefined}
+        pixelFormat="yuv"
         photo={false}
         video={false}
         audio={false}
