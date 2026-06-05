@@ -1,5 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { StyleSheet, View, Text, TouchableOpacity, Animated } from 'react-native';
+import { StyleSheet, View, Text, TouchableOpacity, Animated, Platform } from 'react-native';
+
+const APP_VERSION = '0.0.5'; // bump this each push so you know what's running
 import {
   Camera,
   useCameraDevice,
@@ -148,32 +150,30 @@ export default function CameraScreen() {
       }
 
       // Detect pixel format from buffer size:
-      // YUV_420_888 → bufLen ≈ w*h*1.5  (Y plane is first w*h bytes)
-      // BGRA/RGBA   → bufLen ≈ w*h*4
-      // Some devices use row-padded YUV where rowStride > width
-      const expectedYUV = w * h * 1.5;
-      const expectedRGBA = w * h * 4;
-      const isYUV = bufLen <= expectedYUV * 1.1; // within 10% of YUV size
+      // YUV_420_888 (Android) → bufLen ≈ w*h*1.5
+      // BGRA/RGB    (iOS)     → bufLen ≈ w*h*4
+      const isYUV = bufLen < w * h * 2;
 
       // Sample the center 20% horizontal strip
       const top = Math.floor(h * 0.4);
       const bot = Math.floor(h * 0.6);
       const step = 6;
-      // Some devices pad rows — estimate row stride
-      const yStride = isYUV ? Math.floor(bufLen / (h * 1.5)) : w * 4;
+      // Account for row padding on Android YUV
+      const yStride = isYUV ? Math.round(bufLen / (h * 1.5)) : w * 4;
 
       for (let y = top; y < bot; y += 2) {
         for (let x = 0; x < w; x += step) {
           let lum: number;
           if (isYUV) {
+            // Android YUV: Y plane first, 1 byte per pixel
             const idx = y * yStride + x;
             if (idx >= bufLen) continue;
             lum = pixels[idx];
           } else {
+            // iOS BGRA: 4 bytes per pixel → B=0, G=1, R=2, A=3
             const idx = (y * w + x) * 4;
             if (idx + 2 >= bufLen) continue;
-            // BGRA on Android, RGBA on iOS
-            lum = pixels[idx] * 0.114 + pixels[idx + 1] * 0.587 + pixels[idx + 2] * 0.299;
+            lum = pixels[idx + 2] * 0.299 + pixels[idx + 1] * 0.587 + pixels[idx] * 0.114;
           }
           brightness += lum;
           count++;
@@ -294,7 +294,7 @@ export default function CameraScreen() {
         format={format}
         fps={format?.maxFps ?? 30}
         frameProcessor={workletsAvailable ? frameProcessor : undefined}
-        pixelFormat="yuv"
+        pixelFormat={Platform.OS === 'ios' ? 'rgb' : 'yuv'}
         photo={false}
         video={false}
         audio={false}
@@ -325,7 +325,7 @@ export default function CameraScreen() {
 
               {/* Debug panel — shows live brightness readings */}
               <View style={styles.debugBox}>
-                <Text style={styles.debugTitle}>SENSOR DEBUG</Text>
+                <Text style={styles.debugTitle}>SENSOR DEBUG  v{APP_VERSION}</Text>
                 <Text style={styles.debugRow}>
                   Worklets: <Text style={{ color: debug.workletsOk ? colors.green : colors.red }}>
                     {debug.workletsOk ? '✓ active' : '✗ not available'}
