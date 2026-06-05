@@ -14,6 +14,7 @@
     "ios": {
       "supportsTablet": false,
       "bundleIdentifier": "com.hyzertech.app",
+      "appleTeamId": "4KY4VKB7A5",
       "infoPlist": {
         "NSCameraUsageDescription": "HyzerTech uses your camera to measure disc speed and spin.",
         "NSMicrophoneUsageDescription": "Microphone access is not used by HyzerTech."
