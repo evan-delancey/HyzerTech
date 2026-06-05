@@ -13,7 +13,6 @@
     },
     "ios": {
       "supportsTablet": false,
-      "newArchEnabled": true,
       "bundleIdentifier": "com.hyzertech.app",
       "appleTeamId": "4KY4VKB7A5",
       "infoPlist": {
@@ -24,7 +23,6 @@
     },
     "android": {
       "package": "com.hyzertech.app",
-      "newArchEnabled": true,
       "adaptiveIcon": {
         "backgroundColor": "#050d14",
         "foregroundImage": "./assets/android-icon-foreground.png",
