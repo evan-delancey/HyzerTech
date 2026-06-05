@@ -13,7 +13,7 @@ import * as Haptics from 'expo-haptics';
 import { colors } from '../lib/theme';
 import { saveThrow } from '../lib/db';
 
-const APP_VERSION = '0.0.9';
+const APP_VERSION = '0.1.0';
 
 let workletsAvailable = false;
 try {
@@ -154,6 +154,8 @@ export default function CameraScreen() {
     let rightX = 0;
     let bufLen = 0;
 
+    // Retain the frame so it isn't released before we access pixel data
+    frame.incrementRefCount();
     try {
       const buf = frame.toArrayBuffer();
       const pixels = new Uint8Array(buf);
@@ -195,9 +197,11 @@ export default function CameraScreen() {
         }
       }
     } catch {
+      frame.decrementRefCount();
       updateDebug(-1, baseline.current, fps, -1, w, h, bpr);
       return;
     }
+    frame.decrementRefCount();
 
     if (count === 0) return;
     const avg = brightness / count;
