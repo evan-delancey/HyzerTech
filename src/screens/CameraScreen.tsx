@@ -13,7 +13,7 @@ import * as Haptics from 'expo-haptics';
 import { colors } from '../lib/theme';
 import { saveThrow } from '../lib/db';
 
-const APP_VERSION = '0.0.7';
+const APP_VERSION = '0.0.8';
 
 let workletsAvailable = false;
 try {
@@ -51,7 +51,13 @@ function calcSpinRpm(angleDelta: number, darkFrames: number, fps: number): numbe
 
 export default function CameraScreen() {
   const device = useCameraDevice('back');
-  const format = useCameraFormat(device, [{ fps: 120 }, { fps: 60 }, { fps: 30 }]);
+  // Prefer high-res high-fps — specify minimum dimensions to avoid tiny formats
+  const format = useCameraFormat(device, [
+    { videoWidth: 1920, videoHeight: 1080, fps: 120 },
+    { videoWidth: 1920, videoHeight: 1080, fps: 60 },
+    { videoWidth: 1280, videoHeight: 720, fps: 60 },
+    { videoWidth: 1280, videoHeight: 720, fps: 30 },
+  ]);
   const { hasPermission, requestPermission } = useCameraPermission();
 
   const [phase, setPhase] = useState<Phase>('idle');
@@ -139,7 +145,8 @@ export default function CameraScreen() {
     // Always report frame dimensions first so debug shows something
     if (!isReady.current) {
       if (w > 0) {
-        updateDebug(0, 0, fps, 0, w, h);
+        // Pass negative bufLen to signal "not ready yet but frame is valid"
+        updateDebug(0, 0, fps, frame.isValid ? -2 : -3, w, h);
       }
       return;
     }
@@ -292,7 +299,7 @@ export default function CameraScreen() {
         format={format}
         fps={format?.maxFps ?? 30}
         frameProcessor={workletsAvailable ? frameProcessor : undefined}
-        pixelFormat={Platform.OS === 'ios' ? 'rgb' : 'yuv'}
+        pixelFormat="yuv"
         photo={false}
         video={false}
         audio={false}
@@ -331,7 +338,11 @@ export default function CameraScreen() {
                 <Text style={styles.debugRow}>Frame: <Text style={styles.debugVal}>{debug.frameW}×{debug.frameH}</Text></Text>
                 <Text style={styles.debugRow}>
                   Buffer: <Text style={styles.debugVal}>
-                    {debug.bufLen === 0 ? 'EMPTY ⚠️' : debug.bufLen === -1 ? 'ERROR ⚠️' : `${debug.bufLen} bytes`}
+                    {debug.bufLen === 0 ? 'EMPTY ⚠️'
+                      : debug.bufLen === -1 ? 'EXCEPTION ⚠️'
+                      : debug.bufLen === -2 ? 'not started'
+                      : debug.bufLen === -3 ? 'invalid frame'
+                      : `${debug.bufLen} bytes ✓`}
                   </Text>
                 </Text>
                 <Text style={styles.debugRow}>Brightness: <Text style={styles.debugVal}>{debug.brightness}</Text></Text>
