@@ -51,12 +51,8 @@ function calcSpinRpm(angleDelta: number, darkFrames: number, fps: number): numbe
 
 export default function CameraScreen() {
   const device = useCameraDevice('back');
-  // Prefer high-res high-fps — specify minimum dimensions to avoid tiny formats
   const format = useCameraFormat(device, [
-    { videoWidth: 1920, videoHeight: 1080, fps: 120 },
-    { videoWidth: 1920, videoHeight: 1080, fps: 60 },
-    { videoWidth: 1280, videoHeight: 720, fps: 60 },
-    { videoWidth: 1280, videoHeight: 720, fps: 30 },
+    { fps: 120 }, { fps: 60 }, { fps: 30 },
   ]);
   const { hasPermission, requestPermission } = useCameraPermission();
 
@@ -219,7 +215,7 @@ export default function CameraScreen() {
     }
 
     // ── Detection ─────────────────────────────────────────────────────────────
-    updateDebug(avg, baseline.current, fps, bufLen, w, h);
+    updateDebug(avg, baseline.current, fps, bufLen, w, h, bpr);
 
     const isDark = avg < baseline.current - DROP_THRESHOLD;
 
