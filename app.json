@@ -36,7 +36,14 @@
     },
     "plugins": [
       "expo-dev-client",
-      "expo-camera"
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "HyzerTech uses your camera to measure disc speed.",
+          "recordAudioAndroid": false,
+          "barcodeScannerEnabled": false
+        }
+      ]
     ],
     "web": {
       "favicon": "./assets/favicon.png"
