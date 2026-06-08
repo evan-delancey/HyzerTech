@@ -10,6 +10,7 @@
     "expo": "~56.0.9",
     "expo-dev-client": "^56.0.18",
     "expo-haptics": "^56.0.3",
+    "expo-sensors": "~56.0.5",
     "expo-speech": "^56.0.3",
     "expo-sqlite": "^56.0.4",
     "expo-status-bar": "~56.0.4",

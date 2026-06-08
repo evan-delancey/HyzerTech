@@ -10,10 +10,11 @@ import {
 import { useRunOnJS, useSharedValue } from 'react-native-worklets-core';
 import * as Speech from 'expo-speech';
 import * as Haptics from 'expo-haptics';
+import { Accelerometer } from 'expo-sensors';
 import { colors } from '../lib/theme';
 import { saveThrow } from '../lib/db';
 
-const APP_VERSION = '0.1.8';
+const APP_VERSION = '0.2.0';
 
 type Phase = 'idle' | 'ready' | 'result';
 interface Result { speedMph: number; spinRpm: number; }
@@ -250,6 +251,30 @@ export default function CameraScreen() {
   const simulateThrow = useCallback(() => {
     onDisc(3, 180, format?.maxFps ?? 30);
   }, [onDisc, format]);
+
+  // Detect when the phone is laid flat, camera facing up → auto-arm + announce.
+  // Lifting the phone disarms it, so the next placement re-announces.
+  const wasFlatRef = useRef(false);
+  useEffect(() => {
+    Accelerometer.setUpdateInterval(300);
+    const sub = Accelerometer.addListener(({ x, y, z }) => {
+      // Flat & camera-up: z near ±1g (lying flat), x/y near 0 (not tilted).
+      const isFlat = Math.abs(z) > 0.85 && Math.abs(x) < 0.35 && Math.abs(y) < 0.35;
+
+      if (isFlat && !wasFlatRef.current) {
+        // Just placed down flat → arm and announce
+        wasFlatRef.current = true;
+        startReady();
+        Speech.speak('Ready to record', { rate: 0.95 });
+      } else if (!isFlat && wasFlatRef.current) {
+        // Picked up → disarm
+        wasFlatRef.current = false;
+        stopReady();
+      }
+    });
+    return () => sub.remove();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   if (!hasPermission) {
     return (
