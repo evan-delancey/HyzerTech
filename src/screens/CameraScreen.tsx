@@ -14,7 +14,7 @@ import { VolumeManager } from 'react-native-volume-manager';
 import { colors } from '../lib/theme';
 import { saveThrow } from '../lib/db';
 
-const APP_VERSION = '0.2.1';
+const APP_VERSION = '0.2.2';
 
 type Phase = 'idle' | 'ready' | 'result';
 interface Result { speedMph: number; spinRpm: number; }
@@ -27,9 +27,10 @@ const DISC_DIAMETER_CM = 21.2;
 const CAMERA_HEIGHT_CM = 152;
 const H_FOV_DEG = 69;
 // Sensitivity tuning — a disc 5ft up only dims a small patch of sky briefly.
-const DROP_THRESHOLD = 8;        // avg brightness drop (whole-frame) — lowered
-const DARK_PX_DROP = 30;         // a pixel this much darker than baseline = "dark"
-const DARK_FRAC_THRESHOLD = 0.008; // ~0.8% of sampled pixels dark = disc cluster
+const DROP_THRESHOLD = 5;          // avg brightness drop vs baseline (whole-frame)
+const SUDDEN_DROP = 4;             // avg drop vs PREVIOUS frame (catches fast transients)
+const DARK_PX_DROP = 15;           // a pixel this much darker than baseline = "dark"
+const DARK_FRAC_THRESHOLD = 0.003; // ~0.3% of sampled pixels dark = disc cluster
 const MAX_DARK_FRAMES = 60;
 
 function calcSpeedMph(darkFrames: number, fps: number): number {
@@ -65,6 +66,7 @@ export default function CameraScreen() {
   const inEventRef = useSharedValue(false);
   const angleDeltaRef = useSharedValue(0);
   const lastAngleRef = useSharedValue(-1);
+  const prevAvgRef = useSharedValue(-1); // previous frame brightness (temporal diff)
 
   useEffect(() => { if (!hasPermission) requestPermission(); }, [hasPermission, requestPermission]);
 
@@ -162,8 +164,8 @@ export default function CameraScreen() {
       const top = Math.floor(h * 0.1);
       const bot = Math.floor(h * 0.9);
 
-      for (let y = top; y < bot; y += 4) {
-        for (let x = 0; x < w; x += 6) {
+      for (let y = top; y < bot; y += 2) {
+        for (let x = 0; x < w; x += 2) {
           let lum: number;
           if (isYUV) {
             const idx = y * yStride + x;
@@ -209,11 +211,16 @@ export default function CameraScreen() {
 
     updateDebug(avg, baselineRef.value, fps, bufLen, w, h, bpr);
 
-    // Sensitive trigger: EITHER overall dimming OR a localized dark cluster
-    // (a small disc high above only darkens a few % of pixels for 1-2 frames).
+    // Sensitive trigger: ANY of —
+    //  (a) overall dimming vs the calibrated baseline,
+    //  (b) a localized dark cluster (small disc silhouette), or
+    //  (c) a sudden drop vs the PREVIOUS frame (fast disc transient).
+    const suddenDrop = prevAvgRef.value > 0 && avg < prevAvgRef.value - SUDDEN_DROP;
+    prevAvgRef.value = avg;
     const isDark =
       avg < baselineRef.value - DROP_THRESHOLD ||
-      darkFrac > DARK_FRAC_THRESHOLD;
+      darkFrac > DARK_FRAC_THRESHOLD ||
+      suddenDrop;
 
     if (isDark) {
       if (!inEventRef.value) {
@@ -331,10 +338,14 @@ export default function CameraScreen() {
         <View style={styles.center}>
           {phase === 'idle' && (
             <View style={styles.idleBox}>
-              <Text style={styles.instruction}>Place your phone camera-up on the ground, 5 feet in front of where you throw.</Text>
-              <TouchableOpacity style={styles.startBtn} onPress={startReady}>
-                <Text style={styles.startBtnText}>START</Text>
-              </TouchableOpacity>
+              <Text style={styles.instruction}>
+                Place your phone camera-up on the ground, 5 feet in front of where you throw.
+              </Text>
+              <View style={styles.volPrompt}>
+                <Text style={styles.volPromptText}>Press the</Text>
+                <Text style={styles.volPromptKey}>VOLUME&nbsp;UP</Text>
+                <Text style={styles.volPromptText}>button to start</Text>
+              </View>
             </View>
           )}
 
@@ -368,12 +379,7 @@ export default function CameraScreen() {
                 </Text>
               </View>
 
-              <TouchableOpacity style={styles.simBtn} onPress={simulateThrow}>
-                <Text style={styles.simBtnText}>Simulate Throw (dev)</Text>
-              </TouchableOpacity>
-              <TouchableOpacity style={styles.stopBtn} onPress={stopReady}>
-                <Text style={styles.stopBtnText}>STOP</Text>
-              </TouchableOpacity>
+              <Text style={styles.volHint}>Press Volume Up again to re-arm</Text>
             </View>
           )}
 
@@ -408,6 +414,10 @@ const styles = StyleSheet.create({
   instruction: { color: colors.white, fontSize: 18, textAlign: 'center', lineHeight: 26, marginBottom: 40 },
   startBtn: { backgroundColor: colors.cyan, borderRadius: 50, paddingHorizontal: 60, paddingVertical: 18 },
   startBtnText: { color: colors.bg, fontSize: 20, fontWeight: '900', letterSpacing: 3 },
+  volPrompt: { alignItems: 'center' },
+  volPromptText: { color: colors.gray, fontSize: 15, marginVertical: 2 },
+  volPromptKey: { color: colors.cyan, fontSize: 26, fontWeight: '900', letterSpacing: 2, marginVertical: 6 },
+  volHint: { color: colors.gray, fontSize: 12, marginTop: 8 },
   readyBox: { alignItems: 'center', width: '100%', paddingHorizontal: 20 },
   pulseRing: { width: 120, height: 120, borderRadius: 60, borderWidth: 3, borderColor: colors.cyan, marginBottom: -60, opacity: 0.5 },
   readyText: { color: colors.cyan, fontSize: 36, fontWeight: '900', letterSpacing: 6, marginBottom: 4 },
