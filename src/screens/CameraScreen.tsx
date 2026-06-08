@@ -10,11 +10,11 @@ import {
 import { useRunOnJS, useSharedValue } from 'react-native-worklets-core';
 import * as Speech from 'expo-speech';
 import * as Haptics from 'expo-haptics';
-import { Accelerometer } from 'expo-sensors';
+import { VolumeManager } from 'react-native-volume-manager';
 import { colors } from '../lib/theme';
 import { saveThrow } from '../lib/db';
 
-const APP_VERSION = '0.2.0';
+const APP_VERSION = '0.2.1';
 
 type Phase = 'idle' | 'ready' | 'result';
 interface Result { speedMph: number; spinRpm: number; }
@@ -26,8 +26,11 @@ interface DebugInfo {
 const DISC_DIAMETER_CM = 21.2;
 const CAMERA_HEIGHT_CM = 152;
 const H_FOV_DEG = 69;
-const DROP_THRESHOLD = 25;
-const MAX_DARK_FRAMES = 45;
+// Sensitivity tuning — a disc 5ft up only dims a small patch of sky briefly.
+const DROP_THRESHOLD = 8;        // avg brightness drop (whole-frame) — lowered
+const DARK_PX_DROP = 30;         // a pixel this much darker than baseline = "dark"
+const DARK_FRAC_THRESHOLD = 0.008; // ~0.8% of sampled pixels dark = disc cluster
+const MAX_DARK_FRAMES = 60;
 
 function calcSpeedMph(darkFrames: number, fps: number): number {
   const durationSec = Math.max(darkFrames, 1) / fps;
@@ -131,9 +134,14 @@ export default function CameraScreen() {
 
     let brightness = 0;
     let count = 0;
+    let darkPx = 0;
     let leftX = w;
     let rightX = 0;
     let bufLen = 0;
+
+    // Per-pixel "dark" cutoff relative to the calibrated bright baseline.
+    // During calibration baseline is -1, so use a low cutoff (won't matter yet).
+    const darkCutoff = baselineRef.value > 0 ? baselineRef.value - DARK_PX_DROP : -1;
 
     try {
       const buf = frame.toArrayBuffer();
@@ -150,11 +158,12 @@ export default function CameraScreen() {
       const isYUV = bufLen < w * h * 2;
       const yStride = isYUV ? (bpr > 0 ? bpr : w) : w * 4;
 
-      const top = Math.floor(h * 0.4);
-      const bot = Math.floor(h * 0.6);
+      // Sample almost the whole frame (disc can cross anywhere), fine step.
+      const top = Math.floor(h * 0.1);
+      const bot = Math.floor(h * 0.9);
 
-      for (let y = top; y < bot; y += 2) {
-        for (let x = 0; x < w; x += 8) {
+      for (let y = top; y < bot; y += 4) {
+        for (let x = 0; x < w; x += 6) {
           let lum: number;
           if (isYUV) {
             const idx = y * yStride + x;
@@ -167,7 +176,9 @@ export default function CameraScreen() {
           }
           brightness += lum;
           count++;
-          if (lum < 60) {
+          // Count pixels that are notably darker than the bright baseline → disc
+          if (darkCutoff > 0 && lum < darkCutoff) {
+            darkPx++;
             if (x < leftX) leftX = x;
             if (x > rightX) rightX = x;
           }
@@ -184,6 +195,7 @@ export default function CameraScreen() {
 
     if (count === 0) return;
     const avg = brightness / count;
+    const darkFrac = darkPx / count;
 
     // Calibration
     if (baselineRef.value < 0 || calibCountRef.value < 40) {
@@ -197,7 +209,11 @@ export default function CameraScreen() {
 
     updateDebug(avg, baselineRef.value, fps, bufLen, w, h, bpr);
 
-    const isDark = avg < baselineRef.value - DROP_THRESHOLD;
+    // Sensitive trigger: EITHER overall dimming OR a localized dark cluster
+    // (a small disc high above only darkens a few % of pixels for 1-2 frames).
+    const isDark =
+      avg < baselineRef.value - DROP_THRESHOLD ||
+      darkFrac > DARK_FRAC_THRESHOLD;
 
     if (isDark) {
       if (!inEventRef.value) {
@@ -252,27 +268,31 @@ export default function CameraScreen() {
     onDisc(3, 180, format?.maxFps ?? 30);
   }, [onDisc, format]);
 
-  // Detect when the phone is laid flat, camera facing up → auto-arm + announce.
-  // Lifting the phone disarms it, so the next placement re-announces.
-  const wasFlatRef = useRef(false);
+  // Press the volume-up button to arm → announce "ready to throw".
+  // We hide the native volume HUD and keep volume mid-range so there's always
+  // headroom for an "up" press to register as a volume change event.
+  const lastVolRef = useRef(0.5);
   useEffect(() => {
-    Accelerometer.setUpdateInterval(300);
-    const sub = Accelerometer.addListener(({ x, y, z }) => {
-      // Flat & camera-up: z near ±1g (lying flat), x/y near 0 (not tilted).
-      const isFlat = Math.abs(z) > 0.85 && Math.abs(x) < 0.35 && Math.abs(y) < 0.35;
+    let sub: { remove: () => void } | undefined;
+    VolumeManager.showNativeVolumeUI({ enabled: false });
+    VolumeManager.setVolume(0.5).catch(() => {});
+    lastVolRef.current = 0.5;
 
-      if (isFlat && !wasFlatRef.current) {
-        // Just placed down flat → arm and announce
-        wasFlatRef.current = true;
+    sub = VolumeManager.addVolumeListener((result) => {
+      const v = result.volume;
+      if (v > lastVolRef.current + 0.005) {
+        // Volume went up → treat as the "arm" button press
         startReady();
-        Speech.speak('Ready to record', { rate: 0.95 });
-      } else if (!isFlat && wasFlatRef.current) {
-        // Picked up → disarm
-        wasFlatRef.current = false;
-        stopReady();
+        Speech.speak('Ready to throw', { rate: 0.95 });
+      }
+      lastVolRef.current = v;
+      // Reset toward mid so repeated up-presses keep firing (and never max out)
+      if (v > 0.85 || v < 0.15) {
+        VolumeManager.setVolume(0.5).catch(() => {});
+        lastVolRef.current = 0.5;
       }
     });
-    return () => sub.remove();
+    return () => sub?.remove();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
