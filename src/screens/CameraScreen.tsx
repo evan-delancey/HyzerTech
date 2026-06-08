@@ -7,13 +7,13 @@ import {
   useCameraPermission,
   useFrameProcessor,
 } from 'react-native-vision-camera';
-import { useRunOnJS } from 'react-native-worklets-core';
+import { useRunOnJS, useSharedValue } from 'react-native-worklets-core';
 import * as Speech from 'expo-speech';
 import * as Haptics from 'expo-haptics';
 import { colors } from '../lib/theme';
 import { saveThrow } from '../lib/db';
 
-const APP_VERSION = '0.1.7';
+const APP_VERSION = '0.1.8';
 
 type Phase = 'idle' | 'ready' | 'result';
 interface Result { speedMph: number; spinRpm: number; }
@@ -52,14 +52,15 @@ export default function CameraScreen() {
   const pulseAnim = useRef(new Animated.Value(1)).current;
   const resultTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Plain refs — accessible from worklet via closure
-  const isReadyRef = useRef(false);
-  const baselineRef = useRef(-1);
-  const calibCountRef = useRef(0);
-  const darkCountRef = useRef(0);
-  const inEventRef = useRef(false);
-  const angleDeltaRef = useRef(0);
-  const lastAngleRef = useRef(-1);
+  // Shared values — these DO cross the JS<->camera-thread boundary.
+  // (Plain useRef does NOT: the worklet captures a frozen copy.)
+  const isReadyRef = useSharedValue(false);
+  const baselineRef = useSharedValue(-1);
+  const calibCountRef = useSharedValue(0);
+  const darkCountRef = useSharedValue(0);
+  const inEventRef = useSharedValue(false);
+  const angleDeltaRef = useSharedValue(0);
+  const lastAngleRef = useSharedValue(-1);
 
   useEffect(() => { if (!hasPermission) requestPermission(); }, [hasPermission, requestPermission]);
 
@@ -83,13 +84,13 @@ export default function CameraScreen() {
   }, []);
 
   const onDisc = useRunOnJS((darkFrames: number, angle: number, fps: number) => {
-    if (!isReadyRef.current) return;
-    isReadyRef.current = false;
+    if (!isReadyRef.value) return;
+    isReadyRef.value = false;
 
     const mph = calcSpeedMph(darkFrames, fps);
     const rpm = calcSpinRpm(angle, darkFrames, fps);
 
-    if (mph < 3 || mph > 130) { isReadyRef.current = true; return; }
+    if (mph < 3 || mph > 130) { isReadyRef.value = true; return; }
 
     setResult({ speedMph: mph, spinRpm: rpm });
     setPhase('result');
@@ -98,12 +99,12 @@ export default function CameraScreen() {
     Speech.speak(`${mph} miles per hour. ${rpm} R P M.`, { rate: 0.9 });
 
     resultTimeoutRef.current = setTimeout(() => {
-      baselineRef.current = -1;
-      calibCountRef.current = 0;
-      darkCountRef.current = 0;
-      inEventRef.current = false;
+      baselineRef.value = -1;
+      calibCountRef.value = 0;
+      darkCountRef.value = 0;
+      inEventRef.value = false;
       setPhase('ready');
-      isReadyRef.current = true;
+      isReadyRef.value = true;
     }, 4000);
   }, []);
 
@@ -119,7 +120,7 @@ export default function CameraScreen() {
     const bpr = frame.bytesPerRow;
     const fps = format?.maxFps ?? 30;
 
-    if (!isReadyRef.current) {
+    if (!isReadyRef.value) {
       updateDebug(0, 0, fps, -2, w, h, bpr);
       return;
     }
@@ -140,7 +141,7 @@ export default function CameraScreen() {
 
       if (bufLen === 0) {
         (frame as any).decrementRefCount();
-        updateDebug(0, baselineRef.current, fps, 0, w, h, bpr);
+        updateDebug(0, baselineRef.value, fps, 0, w, h, bpr);
         return;
       }
 
@@ -173,7 +174,7 @@ export default function CameraScreen() {
       }
     } catch {
       (frame as any).decrementRefCount();
-      updateDebug(-1, baselineRef.current, fps, -1, w, h, bpr);
+      updateDebug(-1, baselineRef.value, fps, -1, w, h, bpr);
       return;
     }
 
@@ -184,67 +185,67 @@ export default function CameraScreen() {
     const avg = brightness / count;
 
     // Calibration
-    if (baselineRef.current < 0 || calibCountRef.current < 40) {
-      baselineRef.current = calibCountRef.current === 0
+    if (baselineRef.value < 0 || calibCountRef.value < 40) {
+      baselineRef.value = calibCountRef.value === 0
         ? avg
-        : (baselineRef.current * calibCountRef.current + avg) / (calibCountRef.current + 1);
-      calibCountRef.current = calibCountRef.current + 1;
-      updateDebug(avg, baselineRef.current, fps, bufLen, w, h, bpr);
+        : (baselineRef.value * calibCountRef.value + avg) / (calibCountRef.value + 1);
+      calibCountRef.value = calibCountRef.value + 1;
+      updateDebug(avg, baselineRef.value, fps, bufLen, w, h, bpr);
       return;
     }
 
-    updateDebug(avg, baselineRef.current, fps, bufLen, w, h, bpr);
+    updateDebug(avg, baselineRef.value, fps, bufLen, w, h, bpr);
 
-    const isDark = avg < baselineRef.current - DROP_THRESHOLD;
+    const isDark = avg < baselineRef.value - DROP_THRESHOLD;
 
     if (isDark) {
-      if (!inEventRef.current) {
-        inEventRef.current = true;
-        darkCountRef.current = 0;
-        angleDeltaRef.current = 0;
-        lastAngleRef.current = -1;
+      if (!inEventRef.value) {
+        inEventRef.value = true;
+        darkCountRef.value = 0;
+        angleDeltaRef.value = 0;
+        lastAngleRef.value = -1;
       }
-      darkCountRef.current = darkCountRef.current + 1;
+      darkCountRef.value = darkCountRef.value + 1;
 
       if (rightX > leftX) {
         const cx = (leftX + rightX) / 2;
         const angle = (cx / w) * 180;
-        if (lastAngleRef.current >= 0) {
-          let d = angle - lastAngleRef.current;
+        if (lastAngleRef.value >= 0) {
+          let d = angle - lastAngleRef.value;
           if (d > 90) d -= 180;
           if (d < -90) d += 180;
-          angleDeltaRef.current = angleDeltaRef.current + d;
+          angleDeltaRef.value = angleDeltaRef.value + d;
         }
-        lastAngleRef.current = angle;
+        lastAngleRef.value = angle;
       }
 
-      if (darkCountRef.current > MAX_DARK_FRAMES) {
-        inEventRef.current = false;
-        darkCountRef.current = 0;
-        baselineRef.current = -1;
-        calibCountRef.current = 0;
+      if (darkCountRef.value > MAX_DARK_FRAMES) {
+        inEventRef.value = false;
+        darkCountRef.value = 0;
+        baselineRef.value = -1;
+        calibCountRef.value = 0;
       }
-    } else if (inEventRef.current) {
-      if (darkCountRef.current >= 1) {
-        onDisc(darkCountRef.current, angleDeltaRef.current, fps);
+    } else if (inEventRef.value) {
+      if (darkCountRef.value >= 1) {
+        onDisc(darkCountRef.value, angleDeltaRef.value, fps);
       }
-      inEventRef.current = false;
-      darkCountRef.current = 0;
+      inEventRef.value = false;
+      darkCountRef.value = 0;
     }
   }, [format, updateDebug, onDisc]);
 
   const startReady = () => {
-    baselineRef.current = -1;
-    calibCountRef.current = 0;
-    darkCountRef.current = 0;
-    inEventRef.current = false;
+    baselineRef.value = -1;
+    calibCountRef.value = 0;
+    darkCountRef.value = 0;
+    inEventRef.value = false;
     if (resultTimeoutRef.current) clearTimeout(resultTimeoutRef.current);
     setResult(null);
     setPhase('ready');
-    isReadyRef.current = true;
+    isReadyRef.value = true;
   };
 
-  const stopReady = () => { isReadyRef.current = false; setPhase('idle'); };
+  const stopReady = () => { isReadyRef.value = false; setPhase('idle'); };
 
   const simulateThrow = useCallback(() => {
     onDisc(3, 180, format?.maxFps ?? 30);
