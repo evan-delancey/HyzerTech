@@ -1,5 +1,5 @@
-import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { StyleSheet, View, Text, TouchableOpacity, Animated, Platform } from 'react-native';
+import React, { useEffect, useRef, useState } from 'react';
+import { StyleSheet, View, Text, TouchableOpacity, Animated } from 'react-native';
 import {
   Camera,
   useCameraDevice,
@@ -8,42 +8,44 @@ import {
   useFrameProcessor,
 } from 'react-native-vision-camera';
 import { useRunOnJS, useSharedValue } from 'react-native-worklets-core';
+import { VolumeManager } from 'react-native-volume-manager';
 import * as Speech from 'expo-speech';
 import * as Haptics from 'expo-haptics';
-import { VolumeManager } from 'react-native-volume-manager';
 import { colors } from '../lib/theme';
 import { saveThrow } from '../lib/db';
 
-const APP_VERSION = '0.2.2';
+const APP_VERSION = '0.3.0';
+
+// ── Physics ──────────────────────────────────────────────────────────────────
+const DISC_DIAMETER_CM = 21.2;
+const CAMERA_HEIGHT_CM = 152; // 5 ft — assumed disc altitude above the lens
+const H_FOV_DEG = 69;
+// Spin is not optically measurable at this resolution/blur yet; estimate from
+// speed using the typical disc-golf backhand ratio (~15–20 rpm per mph).
+const RPM_PER_MPH = 17;
+
+// ── Detection grid ───────────────────────────────────────────────────────────
+// The frame is sampled on a fixed 96×72 lattice (≈7k pixels, constant cost at
+// any camera resolution) grouped into 12×9 cells of 8×8 samples each. Each
+// cell keeps its own running brightness baseline, so a small disc that darkens
+// just one cell triggers even though the whole-frame average barely moves.
+const GRID_X = 12;
+const GRID_Y = 9;
+const CELLS = GRID_X * GRID_Y;
+const SAMP_X = 96;
+const SAMP_Y = 72;
+const CALIB_FRAMES = 15;      // frames to settle baselines after arming
+const CELL_DIP_ABS = 8;       // min absolute luminance dip to flag a cell
+const CELL_DIP_FRAC = 0.12;   // min relative dip (12% under cell baseline)
+const EVENT_MAX_FRAMES = 90;  // longer than this = shadow/person, not a disc
+const EVENT_MAX_GAP = 2;      // frames of "no dark cells" allowed mid-event
 
 type Phase = 'idle' | 'ready' | 'result';
 interface Result { speedMph: number; spinRpm: number; }
 interface DebugInfo {
   brightness: number; baseline: number; fps: number;
   bufLen: number; frameW: number; frameH: number; bpr: number;
-}
-
-const DISC_DIAMETER_CM = 21.2;
-const CAMERA_HEIGHT_CM = 152;
-const H_FOV_DEG = 69;
-// Sensitivity tuning — a disc 5ft up only dims a small patch of sky briefly.
-const DROP_THRESHOLD = 5;          // avg brightness drop vs baseline (whole-frame)
-const SUDDEN_DROP = 4;             // avg drop vs PREVIOUS frame (catches fast transients)
-const DARK_PX_DROP = 15;           // a pixel this much darker than baseline = "dark"
-const DARK_FRAC_THRESHOLD = 0.003; // ~0.3% of sampled pixels dark = disc cluster
-const MAX_DARK_FRAMES = 60;
-
-function calcSpeedMph(darkFrames: number, fps: number): number {
-  const durationSec = Math.max(darkFrames, 1) / fps;
-  const hFovRad = (H_FOV_DEG * Math.PI) / 180;
-  const sceneWidthCm = 2 * CAMERA_HEIGHT_CM * Math.tan(hFovRad / 2);
-  const speedCmPerSec = DISC_DIAMETER_CM / durationSec;
-  return Math.round(speedCmPerSec * 0.0223694 * 10) / 10;
-}
-
-function calcSpinRpm(angleDelta: number, darkFrames: number, fps: number): number {
-  const durationSec = Math.max(darkFrames, 1) / fps;
-  return Math.round(Math.abs(angleDelta) / 360 / durationSec * 60);
+  darkCells: number; calib: number;
 }
 
 export default function CameraScreen() {
@@ -53,20 +55,17 @@ export default function CameraScreen() {
 
   const [phase, setPhase] = useState<Phase>('idle');
   const [result, setResult] = useState<Result | null>(null);
-  const [debug, setDebug] = useState<DebugInfo>({ brightness: 0, baseline: 0, fps: 0, bufLen: 0, frameW: 0, frameH: 0, bpr: 0 });
+  const [debug, setDebug] = useState<DebugInfo>({
+    brightness: 0, baseline: 0, fps: 0, bufLen: -2,
+    frameW: 0, frameH: 0, bpr: 0, darkCells: 0, calib: 0,
+  });
   const pulseAnim = useRef(new Animated.Value(1)).current;
   const resultTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
-  // Shared values — these DO cross the JS<->camera-thread boundary.
-  // (Plain useRef does NOT: the worklet captures a frozen copy.)
+  // Shared values cross the JS <-> camera-thread boundary.
   const isReadyRef = useSharedValue(false);
-  const baselineRef = useSharedValue(-1);
-  const calibCountRef = useSharedValue(0);
-  const darkCountRef = useSharedValue(0);
-  const inEventRef = useSharedValue(false);
-  const angleDeltaRef = useSharedValue(0);
-  const lastAngleRef = useSharedValue(-1);
-  const prevAvgRef = useSharedValue(-1); // previous frame brightness (temporal diff)
+  // Bumping the epoch makes the worklet rebuild its grid state + recalibrate.
+  const epochRef = useSharedValue(0);
 
   useEffect(() => { if (!hasPermission) requestPermission(); }, [hasPermission, requestPermission]);
 
@@ -81,23 +80,53 @@ export default function CameraScreen() {
     }
   }, [phase, pulseAnim]);
 
-  // useRunOnJS: worklets-core hook that creates worklet-callable JS callbacks
   const updateDebug = useRunOnJS((
-    brightness: number, base: number, fps: number,
-    bufLen: number, fw: number, fh: number, bpr: number
+    brightness: number, base: number, fps: number, bufLen: number,
+    fw: number, fh: number, bpr: number, darkCells: number, calib: number
   ) => {
-    setDebug({ brightness: Math.round(brightness), baseline: Math.round(base), fps, bufLen, frameW: fw, frameH: fh, bpr });
+    setDebug({
+      brightness: Math.round(brightness), baseline: Math.round(base), fps,
+      bufLen, frameW: fw, frameH: fh, bpr, darkCells, calib,
+    });
   }, []);
 
-  const onDisc = useRunOnJS((darkFrames: number, angle: number, fps: number) => {
+  // Called from the worklet when a disc event completes.
+  // Speed = centroid displacement (px) converted to cm at the assumed
+  // altitude, divided by elapsed time.
+  const onDisc = useRunOnJS((
+    frames: number, firstCx: number, firstCy: number,
+    lastCx: number, lastCy: number, dtMs: number, w: number, fps: number
+  ) => {
     if (!isReadyRef.value) return;
+
+    const hFovRad = (H_FOV_DEG * Math.PI) / 180;
+    const sceneWidthCm = 2 * CAMERA_HEIGHT_CM * Math.tan(hFovRad / 2);
+    const cmPerPx = sceneWidthCm / w;
+
+    let mph: number;
+    if (frames >= 2) {
+      const dx = lastCx - firstCx;
+      const dy = lastCy - firstCy;
+      const dispPx = Math.sqrt(dx * dx + dy * dy);
+      // Stationary darkening (person leaning over, shadow) — not a disc.
+      if (dispPx < w * 0.03) return;
+      // Use frame timestamps when sane, else fall back to frame count / fps.
+      const elapsedMs = dtMs > 1 && dtMs < 5000 ? dtMs : ((frames - 1) / fps) * 1000;
+      if (elapsedMs <= 0) return;
+      const speedCmPerSec = (dispPx * cmPerPx) / (elapsedMs / 1000);
+      mph = speedCmPerSec * 0.0223694;
+    } else {
+      // Single-frame streak: disc crossed in under one frame interval.
+      // Lower-bound estimate: it traveled at least its own diameter.
+      mph = DISC_DIAMETER_CM * fps * 0.0223694;
+    }
+
+    mph = Math.round(mph * 10) / 10;
+    if (mph < 3 || mph > 130) return; // out of plausible range — ignore
+
+    const rpm = Math.round((mph * RPM_PER_MPH) / 10) * 10;
+
     isReadyRef.value = false;
-
-    const mph = calcSpeedMph(darkFrames, fps);
-    const rpm = calcSpinRpm(angle, darkFrames, fps);
-
-    if (mph < 3 || mph > 130) { isReadyRef.value = true; return; }
-
     setResult({ speedMph: mph, spinRpm: rpm });
     setPhase('result');
     saveThrow(mph, rpm);
@@ -105,21 +134,32 @@ export default function CameraScreen() {
     Speech.speak(`${mph} miles per hour. ${rpm} R P M.`, { rate: 0.9 });
 
     resultTimeoutRef.current = setTimeout(() => {
-      baselineRef.value = -1;
-      calibCountRef.value = 0;
-      darkCountRef.value = 0;
-      inEventRef.value = false;
+      epochRef.value = epochRef.value + 1; // recalibrate for next throw
       setPhase('ready');
       isReadyRef.value = true;
     }, 4000);
   }, []);
 
-  // ── Frame processor ──────────────────────────────────────────────────────────
-  // KEY FIX: call frame.incrementRefCount() before toArrayBuffer() to prevent
-  // the frame buffer from being released before our worklet accesses it.
-  // This fixes the empty buffer issue in vision camera v4 + worklets-core.
+  // ── Frame processor ─────────────────────────────────────────────────────────
+  // Grid-cell detection: per-cell baselines + dark-cell centroid tracking.
+  // State lives on the worklet runtime's `global` so it persists across frames
+  // without crossing threads; epochRef bumps force a rebuild.
   const frameProcessor = useFrameProcessor((frame) => {
     'worklet';
+    const g = global as any;
+    if (g.__ht === undefined || g.__htEpoch !== epochRef.value) {
+      g.__ht = {
+        base: new Array(CELLS).fill(-1),
+        calib: 0,
+        inEvent: false, frames: 0, gap: 0,
+        firstCx: 0, firstCy: 0, lastCx: 0, lastCy: 0,
+        firstTs: 0, lastTs: 0,
+        tick: 0,
+      };
+      g.__htEpoch = epochRef.value;
+    }
+    const S = g.__ht;
+    S.tick++;
 
     const w = frame.width;
     const h = frame.height;
@@ -127,157 +167,130 @@ export default function CameraScreen() {
     const fps = format?.maxFps ?? 30;
 
     if (!isReadyRef.value) {
-      updateDebug(0, 0, fps, -2, w, h, bpr);
+      if (S.tick % 30 === 0) updateDebug(0, 0, fps, -2, w, h, bpr, 0, 0);
       return;
     }
 
-    // Retain frame so buffer isn't released before toArrayBuffer() executes
     (frame as any).incrementRefCount();
-
-    let brightness = 0;
-    let count = 0;
-    let darkPx = 0;
-    let leftX = w;
-    let rightX = 0;
     let bufLen = 0;
-
-    // Per-pixel "dark" cutoff relative to the calibrated bright baseline.
-    // During calibration baseline is -1, so use a low cutoff (won't matter yet).
-    const darkCutoff = baselineRef.value > 0 ? baselineRef.value - DARK_PX_DROP : -1;
+    const sums = new Array(CELLS).fill(0);
 
     try {
       const buf = frame.toArrayBuffer();
       const pixels = new Uint8Array(buf);
       bufLen = pixels.length;
-
       if (bufLen === 0) {
         (frame as any).decrementRefCount();
-        updateDebug(0, baselineRef.value, fps, 0, w, h, bpr);
+        if (S.tick % 30 === 0) updateDebug(0, 0, fps, 0, w, h, bpr, 0, S.calib);
         return;
       }
 
-      // YUV_420: bufLen ≈ w*h*1.5 | BGRA: bufLen ≈ w*h*4
       const isYUV = bufLen < w * h * 2;
       const yStride = isYUV ? (bpr > 0 ? bpr : w) : w * 4;
 
-      // Sample almost the whole frame (disc can cross anywhere), fine step.
-      const top = Math.floor(h * 0.1);
-      const bot = Math.floor(h * 0.9);
-
-      for (let y = top; y < bot; y += 2) {
-        for (let x = 0; x < w; x += 2) {
+      // Fixed 96×72 sampling lattice → constant ~7k reads per frame.
+      for (let sy = 0; sy < SAMP_Y; sy++) {
+        const y = ((sy + 0.5) * h / SAMP_Y) | 0;
+        const cellRow = (sy >> 3) * GRID_X; // 8 sample-rows per cell row
+        const rowBase = isYUV ? y * yStride : y * w * 4;
+        for (let sx = 0; sx < SAMP_X; sx++) {
+          const x = ((sx + 0.5) * w / SAMP_X) | 0;
           let lum: number;
           if (isYUV) {
-            const idx = y * yStride + x;
+            const idx = rowBase + x;
             if (idx >= bufLen) continue;
             lum = pixels[idx];
           } else {
-            const idx = (y * w + x) * 4;
+            const idx = rowBase + x * 4;
             if (idx + 2 >= bufLen) continue;
-            lum = pixels[idx + 2] * 0.299 + pixels[idx + 1] * 0.587 + pixels[idx] * 0.114;
+            lum = (pixels[idx + 2] * 77 + pixels[idx + 1] * 150 + pixels[idx] * 29) >> 8;
           }
-          brightness += lum;
-          count++;
-          // Count pixels that are notably darker than the bright baseline → disc
-          if (darkCutoff > 0 && lum < darkCutoff) {
-            darkPx++;
-            if (x < leftX) leftX = x;
-            if (x > rightX) rightX = x;
-          }
+          sums[cellRow + (sx >> 3)] += lum;
         }
       }
     } catch {
       (frame as any).decrementRefCount();
-      updateDebug(-1, baselineRef.value, fps, -1, w, h, bpr);
+      if (S.tick % 30 === 0) updateDebug(-1, 0, fps, -1, w, h, bpr, 0, S.calib);
       return;
     }
-
-    // Release frame retain now that we have the data
     (frame as any).decrementRefCount();
 
-    if (count === 0) return;
-    const avg = brightness / count;
-    const darkFrac = darkPx / count;
+    // ── Per-cell dark test + baseline maintenance ─────────────────────────────
+    let darkCells = 0;
+    let dipSum = 0, cxSum = 0, cySum = 0;
+    let lumTotal = 0, baseTotal = 0, baseCount = 0;
 
-    // Calibration
-    if (baselineRef.value < 0 || calibCountRef.value < 40) {
-      baselineRef.value = calibCountRef.value === 0
-        ? avg
-        : (baselineRef.value * calibCountRef.value + avg) / (calibCountRef.value + 1);
-      calibCountRef.value = calibCountRef.value + 1;
-      updateDebug(avg, baselineRef.value, fps, bufLen, w, h, bpr);
-      return;
+    for (let c = 0; c < CELLS; c++) {
+      const avg = sums[c] >> 6; // 64 samples per cell
+      lumTotal += avg;
+      const b = S.base[c];
+      if (b < 0) { S.base[c] = avg; continue; }
+      baseTotal += b; baseCount++;
+
+      const dip = b - avg;
+      const isDark = S.calib >= CALIB_FRAMES &&
+        dip > CELL_DIP_ABS && dip > b * CELL_DIP_FRAC;
+
+      if (isDark) {
+        darkCells++;
+        const px = ((c % GRID_X) + 0.5) * (w / GRID_X);
+        const py = (((c / GRID_X) | 0) + 0.5) * (h / GRID_Y);
+        dipSum += dip; cxSum += px * dip; cySum += py * dip;
+      } else {
+        // Adapt baseline only from non-dark cells so the disc/shadow never
+        // pollutes it. Faster alpha during calibration.
+        S.base[c] = S.calib < CALIB_FRAMES ? b * 0.7 + avg * 0.3 : b * 0.95 + avg * 0.05;
+      }
+    }
+    if (S.calib < CALIB_FRAMES) S.calib++;
+
+    const avgLum = lumTotal / CELLS;
+    const avgBase = baseCount > 0 ? baseTotal / baseCount : 0;
+    if (S.tick % 6 === 0 || darkCells > 0) {
+      updateDebug(avgLum, avgBase, fps, bufLen, w, h, bpr, darkCells, S.calib);
     }
 
-    updateDebug(avg, baselineRef.value, fps, bufLen, w, h, bpr);
-
-    // Sensitive trigger: ANY of —
-    //  (a) overall dimming vs the calibrated baseline,
-    //  (b) a localized dark cluster (small disc silhouette), or
-    //  (c) a sudden drop vs the PREVIOUS frame (fast disc transient).
-    const suddenDrop = prevAvgRef.value > 0 && avg < prevAvgRef.value - SUDDEN_DROP;
-    prevAvgRef.value = avg;
-    const isDark =
-      avg < baselineRef.value - DROP_THRESHOLD ||
-      darkFrac > DARK_FRAC_THRESHOLD ||
-      suddenDrop;
-
-    if (isDark) {
-      if (!inEventRef.value) {
-        inEventRef.value = true;
-        darkCountRef.value = 0;
-        angleDeltaRef.value = 0;
-        lastAngleRef.value = -1;
+    // ── Event tracking: follow the dark-cluster centroid across frames ───────
+    const ts = frame.timestamp;
+    if (darkCells > 0 && S.calib >= CALIB_FRAMES) {
+      const cx = cxSum / dipSum;
+      const cy = cySum / dipSum;
+      if (!S.inEvent) {
+        S.inEvent = true; S.frames = 1; S.gap = 0;
+        S.firstCx = cx; S.firstCy = cy; S.firstTs = ts;
+      } else {
+        S.frames++;
+        S.gap = 0;
       }
-      darkCountRef.value = darkCountRef.value + 1;
+      S.lastCx = cx; S.lastCy = cy; S.lastTs = ts;
 
-      if (rightX > leftX) {
-        const cx = (leftX + rightX) / 2;
-        const angle = (cx / w) * 180;
-        if (lastAngleRef.value >= 0) {
-          let d = angle - lastAngleRef.value;
-          if (d > 90) d -= 180;
-          if (d < -90) d += 180;
-          angleDeltaRef.value = angleDeltaRef.value + d;
-        }
-        lastAngleRef.value = angle;
+      if (S.frames > EVENT_MAX_FRAMES) {
+        // Parked shadow/person — abort and rebuild baselines.
+        S.inEvent = false; S.frames = 0;
+        for (let c = 0; c < CELLS; c++) S.base[c] = -1;
+        S.calib = 0;
       }
-
-      if (darkCountRef.value > MAX_DARK_FRAMES) {
-        inEventRef.value = false;
-        darkCountRef.value = 0;
-        baselineRef.value = -1;
-        calibCountRef.value = 0;
+    } else if (S.inEvent) {
+      S.gap++;
+      if (S.gap > EVENT_MAX_GAP) {
+        const frames = S.frames;
+        S.inEvent = false; S.frames = 0; S.gap = 0;
+        // timestamp units vary across platforms — onDisc sanity-checks dtMs
+        const dtMs = S.lastTs - S.firstTs;
+        onDisc(frames, S.firstCx, S.firstCy, S.lastCx, S.lastCy, dtMs, w, fps);
       }
-    } else if (inEventRef.value) {
-      if (darkCountRef.value >= 1) {
-        onDisc(darkCountRef.value, angleDeltaRef.value, fps);
-      }
-      inEventRef.value = false;
-      darkCountRef.value = 0;
     }
-  }, [format, updateDebug, onDisc]);
+  }, [isReadyRef, epochRef, format, onDisc, updateDebug]);
 
   const startReady = () => {
-    baselineRef.value = -1;
-    calibCountRef.value = 0;
-    darkCountRef.value = 0;
-    inEventRef.value = false;
     if (resultTimeoutRef.current) clearTimeout(resultTimeoutRef.current);
+    epochRef.value = epochRef.value + 1; // rebuild grid state + recalibrate
     setResult(null);
     setPhase('ready');
     isReadyRef.value = true;
   };
 
-  const stopReady = () => { isReadyRef.value = false; setPhase('idle'); };
-
-  const simulateThrow = useCallback(() => {
-    onDisc(3, 180, format?.maxFps ?? 30);
-  }, [onDisc, format]);
-
-  // Press the volume-up button to arm → announce "ready to throw".
-  // We hide the native volume HUD and keep volume mid-range so there's always
-  // headroom for an "up" press to register as a volume change event.
+  // Volume-up arms the detector (the only way to arm — no on-screen button).
   const lastVolRef = useRef(0.5);
   useEffect(() => {
     let sub: { remove: () => void } | undefined;
@@ -288,12 +301,10 @@ export default function CameraScreen() {
     sub = VolumeManager.addVolumeListener((result) => {
       const v = result.volume;
       if (v > lastVolRef.current + 0.005) {
-        // Volume went up → treat as the "arm" button press
         startReady();
         Speech.speak('Ready to throw', { rate: 0.95 });
       }
       lastVolRef.current = v;
-      // Reset toward mid so repeated up-presses keep firing (and never max out)
       if (v > 0.85 || v < 0.15) {
         VolumeManager.setVolume(0.5).catch(() => {});
         lastVolRef.current = 0.5;
@@ -358,7 +369,6 @@ export default function CameraScreen() {
               <View style={styles.debugBox}>
                 <Text style={styles.debugTitle}>SENSOR DEBUG  v{APP_VERSION}</Text>
                 <Text style={styles.debugRow}>Frame: <Text style={styles.debugVal}>{debug.frameW}×{debug.frameH}</Text></Text>
-                <Text style={styles.debugRow}>BytesPerRow: <Text style={styles.debugVal}>{debug.bpr}</Text></Text>
                 <Text style={styles.debugRow}>
                   Buffer: <Text style={styles.debugVal}>
                     {debug.bufLen === 0 ? 'EMPTY ⚠️'
@@ -369,13 +379,13 @@ export default function CameraScreen() {
                 </Text>
                 <Text style={styles.debugRow}>Brightness: <Text style={styles.debugVal}>{debug.brightness}</Text></Text>
                 <Text style={styles.debugRow}>Baseline: <Text style={styles.debugVal}>{debug.baseline}</Text></Text>
+                <Text style={styles.debugRow}>Dark cells: <Text style={styles.debugVal}>{debug.darkCells}</Text></Text>
                 <Text style={styles.debugRow}>FPS: <Text style={styles.debugVal}>{debug.fps}</Text></Text>
                 <Text style={[styles.debugRow, { color: colors.gray, marginTop: 4, fontSize: 11 }]}>
-                  {debug.bufLen <= 0
-                    ? 'No pixel data yet'
-                    : debug.baseline > 0
-                    ? `Drop: ${debug.baseline - debug.brightness} (trigger at ${DROP_THRESHOLD}+)`
-                    : 'Calibrating...'}
+                  {debug.bufLen <= 0 ? 'No pixel data yet'
+                    : debug.calib < CALIB_FRAMES ? 'Calibrating...'
+                    : debug.darkCells > 0 ? '⚫ OBJECT DETECTED'
+                    : 'Watching for disc'}
                 </Text>
               </View>
 
@@ -391,7 +401,7 @@ export default function CameraScreen() {
               <View style={styles.divider} />
               <Text style={styles.resultLabel}>SPIN</Text>
               <Text style={styles.resultValue}>{result.spinRpm}</Text>
-              <Text style={styles.resultUnit}>rpm</Text>
+              <Text style={styles.resultUnit}>rpm (est)</Text>
             </View>
           )}
         </View>
@@ -412,8 +422,6 @@ const styles = StyleSheet.create({
   btnText: { color: colors.bg, fontWeight: '700', fontSize: 16 },
   idleBox: { alignItems: 'center', paddingHorizontal: 32 },
   instruction: { color: colors.white, fontSize: 18, textAlign: 'center', lineHeight: 26, marginBottom: 40 },
-  startBtn: { backgroundColor: colors.cyan, borderRadius: 50, paddingHorizontal: 60, paddingVertical: 18 },
-  startBtnText: { color: colors.bg, fontSize: 20, fontWeight: '900', letterSpacing: 3 },
   volPrompt: { alignItems: 'center' },
   volPromptText: { color: colors.gray, fontSize: 15, marginVertical: 2 },
   volPromptKey: { color: colors.cyan, fontSize: 26, fontWeight: '900', letterSpacing: 2, marginVertical: 6 },
@@ -426,10 +434,6 @@ const styles = StyleSheet.create({
   debugTitle: { color: colors.cyan, fontSize: 10, letterSpacing: 3, marginBottom: 8, fontWeight: '700' },
   debugRow: { color: colors.white, fontSize: 13, fontFamily: 'Courier New', marginBottom: 2 },
   debugVal: { color: colors.cyanLight, fontWeight: '700' },
-  simBtn: { borderWidth: 1, borderColor: colors.grayDark, borderRadius: 8, paddingHorizontal: 20, paddingVertical: 10, marginBottom: 12 },
-  simBtnText: { color: colors.gray, fontSize: 13 },
-  stopBtn: { borderWidth: 1, borderColor: colors.red, borderRadius: 8, paddingHorizontal: 32, paddingVertical: 12 },
-  stopBtnText: { color: colors.red, fontWeight: '700', letterSpacing: 2 },
   resultBox: { alignItems: 'center', backgroundColor: colors.bgCard, borderRadius: 24, paddingVertical: 36, paddingHorizontal: 60, borderWidth: 1, borderColor: colors.cyan },
   resultLabel: { color: colors.gray, fontSize: 13, letterSpacing: 4, marginBottom: 4 },
   resultValue: { color: colors.cyanLight, fontSize: 64, fontWeight: '900', lineHeight: 70 },
