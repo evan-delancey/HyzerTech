@@ -14,7 +14,7 @@ import * as Haptics from 'expo-haptics';
 import { colors } from '../lib/theme';
 import { saveThrow } from '../lib/db';
 
-const APP_VERSION = '0.3.1';
+const APP_VERSION = '0.3.2';
 
 // The worklet runtime persists `global` between frames. worklets-core's babel
 // plugin treats `global` as a runtime global (not captured) — unlike
@@ -41,10 +41,14 @@ const CELLS = GRID_X * GRID_Y;
 const SAMP_X = 96;
 const SAMP_Y = 72;
 const CALIB_FRAMES = 15;      // frames to settle baselines after arming
-const CELL_DIP_ABS = 8;       // min absolute luminance dip to flag a cell
-const CELL_DIP_FRAC = 0.12;   // min relative dip (12% under cell baseline)
+// High sensitivity: false triggers (leaves, bugs) are acceptable — the user
+// knows when they actually threw. Missing a real throw is the failure mode.
+const CELL_DIP_ABS = 4;       // min absolute luminance dip vs cell baseline
+const CELL_DIP_FRAC = 0.04;   // min relative dip (4% under cell baseline)
+const PREV_DIP_ABS = 5;       // min absolute dip vs the SAME cell last frame
+const PREV_DIP_FRAC = 0.05;   // min relative dip vs last frame (transients)
 const EVENT_MAX_FRAMES = 90;  // longer than this = shadow/person, not a disc
-const EVENT_MAX_GAP = 2;      // frames of "no dark cells" allowed mid-event
+const EVENT_MAX_GAP = 3;      // frames of "no dark cells" allowed mid-event
 
 type Phase = 'idle' | 'ready' | 'result';
 interface Result { speedMph: number; spinRpm: number; }
@@ -156,6 +160,7 @@ export default function CameraScreen() {
     if (g.__ht === undefined || g.__htEpoch !== epochRef.value) {
       g.__ht = {
         base: new Array(CELLS).fill(-1),
+        prev: new Array(CELLS).fill(-1),
         calib: 0,
         inEvent: false, frames: 0, gap: 0,
         firstCx: 0, firstCy: 0, lastCx: 0, lastCy: 0,
@@ -229,19 +234,28 @@ export default function CameraScreen() {
     for (let c = 0; c < CELLS; c++) {
       const avg = sums[c] >> 6; // 64 samples per cell
       lumTotal += avg;
+      const p = S.prev[c];
+      S.prev[c] = avg;
       const b = S.base[c];
       if (b < 0) { S.base[c] = avg; continue; }
       baseTotal += b; baseCount++;
 
+      // Dark vs the cell's own slow baseline, OR a sudden dip vs the same
+      // cell one frame ago — the latter catches fast transients even when
+      // the baseline has drifted (clouds, auto-exposure).
       const dip = b - avg;
-      const isDark = S.calib >= CALIB_FRAMES &&
-        dip > CELL_DIP_ABS && dip > b * CELL_DIP_FRAC;
+      const dipPrev = p >= 0 ? p - avg : 0;
+      const isDark = S.calib >= CALIB_FRAMES && (
+        (dip > CELL_DIP_ABS && dip > b * CELL_DIP_FRAC) ||
+        (dipPrev > PREV_DIP_ABS && dipPrev > p * PREV_DIP_FRAC)
+      );
 
       if (isDark) {
         darkCells++;
         const px = ((c % GRID_X) + 0.5) * (w / GRID_X);
         const py = (((c / GRID_X) | 0) + 0.5) * (h / GRID_Y);
-        dipSum += dip; cxSum += px * dip; cySum += py * dip;
+        const wgt = Math.max(dip, dipPrev, 1); // always positive weight
+        dipSum += wgt; cxSum += px * wgt; cySum += py * wgt;
       } else {
         // Adapt baseline only from non-dark cells so the disc/shadow never
         // pollutes it. Faster alpha during calibration.
