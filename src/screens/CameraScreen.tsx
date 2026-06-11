@@ -14,7 +14,7 @@ import * as Haptics from 'expo-haptics';
 import { colors } from '../lib/theme';
 import { saveThrow } from '../lib/db';
 
-const APP_VERSION = '0.3.3';
+const APP_VERSION = '0.3.4';
 
 // The worklet runtime persists `global` between frames. worklets-core's babel
 // plugin treats `global` as a runtime global (not captured) — unlike
@@ -41,12 +41,18 @@ const CELLS = GRID_X * GRID_Y;
 const SAMP_X = 96;
 const SAMP_Y = 72;
 const CALIB_FRAMES = 15;      // frames to settle baselines after arming
-// High sensitivity: false triggers (leaves, bugs) are acceptable — the user
-// knows when they actually threw. Missing a real throw is the failure mode.
-const CELL_DIP_ABS = 4;       // min absolute luminance dip vs cell baseline
-const CELL_DIP_FRAC = 0.04;   // min relative dip (4% under cell baseline)
-const PREV_DIP_ABS = 5;       // min absolute dip vs the SAME cell last frame
-const PREV_DIP_FRAC = 0.05;   // min relative dip vs last frame (transients)
+// Sensitivity: a real disc dims its cells by 50–150 units; sensor noise and
+// light flicker sit under ~6. These thresholds split that gap.
+const CELL_DIP_ABS = 7;       // min absolute luminance dip vs cell baseline
+const CELL_DIP_FRAC = 0.06;   // min relative dip (6% under cell baseline)
+const PREV_DIP_ABS = 8;       // min absolute dip vs the SAME cell last frame
+const PREV_DIP_FRAC = 0.07;   // min relative dip vs last frame (transients)
+// A disc covers a few cells; indoor light flicker / auto-exposure dims the
+// WHOLE frame at once. If this fraction of cells goes dark simultaneously,
+// it's a global change — ignore it and re-converge baselines.
+const GLOBAL_DARK_FRAC = 0.4;
+// Single-frame blips must be strong (real disc = huge dip) to count.
+const MIN_SINGLE_FRAME_DIP = 20;
 const EVENT_MAX_FRAMES = 90;  // longer than this = shadow/person, not a disc
 const EVENT_MAX_GAP = 3;      // frames of "no dark cells" allowed mid-event
 
@@ -113,9 +119,12 @@ export default function CameraScreen() {
   // altitude, divided by elapsed time.
   const onDisc = useRunOnJS((
     frames: number, firstCx: number, firstCy: number,
-    lastCx: number, lastCy: number, dtMs: number, w: number, fps: number
+    lastCx: number, lastCy: number, dtMs: number, w: number, fps: number,
+    maxDip: number
   ) => {
     if (!isReadyRef.value) return;
+    // A one-frame blip with a weak dip is noise; a real disc dips hard.
+    if (frames < 2 && maxDip < MIN_SINGLE_FRAME_DIP) return;
 
     const hFovRad = (H_FOV_DEG * Math.PI) / 180;
     const sceneWidthCm = 2 * CAMERA_HEIGHT_CM * Math.tan(hFovRad / 2);
@@ -170,7 +179,7 @@ export default function CameraScreen() {
         base: new Array(CELLS).fill(-1),
         prev: new Array(CELLS).fill(-1),
         calib: 0,
-        inEvent: false, frames: 0, gap: 0,
+        inEvent: false, frames: 0, gap: 0, maxDip: 0,
         firstCx: 0, firstCy: 0, lastCx: 0, lastCy: 0,
         firstTs: 0, lastTs: 0,
         tick: 0,
@@ -236,7 +245,7 @@ export default function CameraScreen() {
 
     // ── Per-cell dark test + baseline maintenance ─────────────────────────────
     let darkCells = 0;
-    let dipSum = 0, cxSum = 0, cySum = 0;
+    let dipSum = 0, cxSum = 0, cySum = 0, maxDipFrame = 0;
     let lumTotal = 0, baseTotal = 0, baseCount = 0;
 
     for (let c = 0; c < CELLS; c++) {
@@ -264,6 +273,7 @@ export default function CameraScreen() {
         const py = (((c / GRID_X) | 0) + 0.5) * (h / GRID_Y);
         const wgt = Math.max(dip, dipPrev, 1); // always positive weight
         dipSum += wgt; cxSum += px * wgt; cySum += py * wgt;
+        if (wgt > maxDipFrame) maxDipFrame = wgt;
       } else {
         // Adapt baseline only from non-dark cells so the disc/shadow never
         // pollutes it. Faster alpha during calibration.
@@ -271,6 +281,19 @@ export default function CameraScreen() {
       }
     }
     if (S.calib < CALIB_FRAMES) S.calib++;
+
+    // Global change guard: flicker / auto-exposure / clouds dim the whole
+    // frame at once — a disc never does. Drop the detection and re-converge
+    // all baselines quickly so we're back to watching within a few frames.
+    if (darkCells > CELLS * GLOBAL_DARK_FRAC) {
+      darkCells = 0;
+      maxDipFrame = 0;
+      for (let c = 0; c < CELLS; c++) {
+        const avg = sums[c] >> 6;
+        const b = S.base[c];
+        S.base[c] = b < 0 ? avg : b * 0.7 + avg * 0.3;
+      }
+    }
 
     const avgLum = lumTotal / CELLS;
     const avgBase = baseCount > 0 ? baseTotal / baseCount : 0;
@@ -286,9 +309,11 @@ export default function CameraScreen() {
       if (!S.inEvent) {
         S.inEvent = true; S.frames = 1; S.gap = 0;
         S.firstCx = cx; S.firstCy = cy; S.firstTs = ts;
+        S.maxDip = maxDipFrame;
       } else {
         S.frames++;
         S.gap = 0;
+        if (maxDipFrame > S.maxDip) S.maxDip = maxDipFrame;
       }
       S.lastCx = cx; S.lastCy = cy; S.lastTs = ts;
 
@@ -305,7 +330,7 @@ export default function CameraScreen() {
         S.inEvent = false; S.frames = 0; S.gap = 0;
         // timestamp units vary across platforms — onDisc sanity-checks dtMs
         const dtMs = S.lastTs - S.firstTs;
-        onDisc(frames, S.firstCx, S.firstCy, S.lastCx, S.lastCy, dtMs, w, fps);
+        onDisc(frames, S.firstCx, S.firstCy, S.lastCx, S.lastCy, dtMs, w, fps, S.maxDip);
       }
     }
   }, [isReadyRef, epochRef, targetFps, onDisc, updateDebug]);
