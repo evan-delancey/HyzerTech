@@ -146,7 +146,7 @@ export default function CameraScreen() {
   // without crossing threads; epochRef bumps force a rebuild.
   const frameProcessor = useFrameProcessor((frame) => {
     'worklet';
-    const g = global as any;
+    const g = globalThis as any;
     if (g.__ht === undefined || g.__htEpoch !== epochRef.value) {
       g.__ht = {
         base: new Array(CELLS).fill(-1),
