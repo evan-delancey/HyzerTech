@@ -14,7 +14,13 @@ import * as Haptics from 'expo-haptics';
 import { colors } from '../lib/theme';
 import { saveThrow } from '../lib/db';
 
-const APP_VERSION = '0.3.0';
+const APP_VERSION = '0.3.1';
+
+// The worklet runtime persists `global` between frames. worklets-core's babel
+// plugin treats `global` as a runtime global (not captured) — unlike
+// `globalThis`, which gets captured and would deep-copy the host JS global
+// graph into the worklet (stack overflow). Declare it for TypeScript.
+declare const global: any;
 
 // ── Physics ──────────────────────────────────────────────────────────────────
 const DISC_DIAMETER_CM = 21.2;
@@ -146,7 +152,7 @@ export default function CameraScreen() {
   // without crossing threads; epochRef bumps force a rebuild.
   const frameProcessor = useFrameProcessor((frame) => {
     'worklet';
-    const g = globalThis as any;
+    const g = global;
     if (g.__ht === undefined || g.__htEpoch !== epochRef.value) {
       g.__ht = {
         base: new Array(CELLS).fill(-1),
