@@ -14,7 +14,7 @@ import * as Haptics from 'expo-haptics';
 import { colors } from '../lib/theme';
 import { saveThrow } from '../lib/db';
 
-const APP_VERSION = '0.3.2';
+const APP_VERSION = '0.3.3';
 
 // The worklet runtime persists `global` between frames. worklets-core's babel
 // plugin treats `global` as a runtime global (not captured) — unlike
@@ -60,7 +60,15 @@ interface DebugInfo {
 
 export default function CameraScreen() {
   const device = useCameraDevice('back');
-  const format = useCameraFormat(device, [{ fps: 120 }, { fps: 60 }, { fps: 30 }]);
+  // Resolution first (the old fps-only filter picked a pixelated 192×144
+  // stream), then the highest frame rate available at that resolution.
+  const format = useCameraFormat(device, [
+    { videoResolution: { width: 1280, height: 720 } },
+    { fps: 120 },
+    { fps: 60 },
+  ]);
+  // Cap at 120fps — beyond that the per-frame buffer copies get expensive.
+  const targetFps = Math.min(format?.maxFps ?? 30, 120);
   const { hasPermission, requestPermission } = useCameraPermission();
 
   const [phase, setPhase] = useState<Phase>('idle');
@@ -175,7 +183,7 @@ export default function CameraScreen() {
     const w = frame.width;
     const h = frame.height;
     const bpr = frame.bytesPerRow;
-    const fps = format?.maxFps ?? 30;
+    const fps = targetFps;
 
     if (!isReadyRef.value) {
       if (S.tick % 30 === 0) updateDebug(0, 0, fps, -2, w, h, bpr, 0, 0);
@@ -300,7 +308,7 @@ export default function CameraScreen() {
         onDisc(frames, S.firstCx, S.firstCy, S.lastCx, S.lastCy, dtMs, w, fps);
       }
     }
-  }, [isReadyRef, epochRef, format, onDisc, updateDebug]);
+  }, [isReadyRef, epochRef, targetFps, onDisc, updateDebug]);
 
   const startReady = () => {
     if (resultTimeoutRef.current) clearTimeout(resultTimeoutRef.current);
@@ -353,7 +361,7 @@ export default function CameraScreen() {
         device={device}
         isActive={phase === 'ready'}
         format={format}
-        fps={format?.maxFps ?? 30}
+        fps={targetFps}
         frameProcessor={frameProcessor}
         pixelFormat="yuv"
         photo={false}
